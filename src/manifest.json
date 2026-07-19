@@ -109,6 +109,7 @@
         "router" : {
             "mode" : "hash",
             "base" : "/douluo-game/"
-        }
+        },
+        "publicPath" : "/douluo-game/"
     }
 }
