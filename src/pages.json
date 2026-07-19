@@ -1,0 +1,45 @@
+{
+	"pages": [
+		{
+			"path": "pages/index/index",
+			"style": {
+				"navigationBarTitleText": "命运之书",
+				"navigationBarBackgroundColor": "#FFF8E7",
+				"navigationBarTextStyle": "black",
+				"navigationStyle": "custom"
+			}
+		},
+		{
+			"path": "pages/wheel/wheel",
+			"style": {
+				"navigationBarTitleText": "命运转盘",
+				"navigationBarBackgroundColor": "#FFF8E7",
+				"navigationBarTextStyle": "black",
+				"navigationStyle": "custom"
+			}
+		},
+		{
+			"path": "pages/result/result",
+			"style": {
+				"navigationBarTitleText": "命运之书",
+				"navigationBarBackgroundColor": "#FFF8E7",
+				"navigationBarTextStyle": "black",
+				"navigationStyle": "custom"
+			}
+		},
+		{
+			"path": "pages/character/character",
+			"style": {
+				"navigationBarTitleText": "角色详情",
+				"navigationBarBackgroundColor": "#FFF8E7",
+				"navigationBarTextStyle": "black"
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationBarTextStyle": "black",
+		"navigationBarTitleText": "命运之书",
+		"navigationBarBackgroundColor": "#FFF8E7",
+		"backgroundColor": "#FFFDF5"
+	}
+}

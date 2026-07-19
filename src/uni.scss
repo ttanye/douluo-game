@@ -1,0 +1,79 @@
+// 斗罗大陆 · 命运之书 — 全局样式变量
+
+/* 颜色变量 */
+$uni-color-primary: #F5A623;
+$uni-color-success: #7ED321;
+$uni-color-warning: #F8A726;
+$uni-color-error: #E85D3F;
+
+/* 文字颜色 */
+$uni-text-color: #2C2416;
+$uni-text-color-inverse: #fff;
+$uni-text-color-grey: #6B5E4A;
+$uni-text-color-placeholder: #A09888;
+$uni-text-color-disable: #c0c0c0;
+
+/* 背景颜色 */
+$uni-bg-color: #FFFDF5;
+$uni-bg-color-grey: #FFF8E7;
+$uni-bg-color-hover: #F5ECD7;
+$uni-bg-color-mask: rgba(44, 36, 22, 0.5);
+
+/* 边框颜色 */
+$uni-border-color: #E0D8C8;
+
+/* 尺寸变量 */
+$uni-font-size-sm: 12px;
+$uni-font-size-base: 14px;
+$uni-font-size-lg: 16px;
+
+/* 图片尺寸 */
+$uni-img-size-sm: 20px;
+$uni-img-size-base: 26px;
+$uni-img-size-lg: 40px;
+
+/* Border Radius */
+$uni-border-radius-sm: 4px;
+$uni-border-radius-base: 8px;
+$uni-border-radius-lg: 12px;
+$uni-border-radius-circle: 50%;
+
+/* 间距 */
+$uni-spacing-row-sm: 5px;
+$uni-spacing-row-base: 10px;
+$uni-spacing-row-lg: 15px;
+$uni-spacing-col-sm: 4px;
+$uni-spacing-col-base: 8px;
+$uni-spacing-col-lg: 12px;
+
+/* 透明度 */
+$uni-opacity-disabled: 0.3;
+
+/* 文章场景 */
+$uni-color-title: #2C2416;
+$uni-font-size-title: 22px;
+$uni-color-subtitle: #6B5E4A;
+$uni-font-size-subtitle: 16px;
+$uni-color-paragraph: #3f536e;
+$uni-font-size-paragraph: 14px;
+
+// ========== 斗罗主题扩展变量 ==========
+$douluo-gold: #F5A623;
+$douluo-blue: #4A90D9;
+$douluo-red: #E85D3F;
+$douluo-green: #7ED321;
+$douluo-purple: #9B59B6;
+$douluo-pink: #FF6B9D;
+$douluo-teal: #50E3C2;
+$douluo-bg-warm: #FFF8E7;
+$douluo-bg-light: #FFFDF5;
+$douluo-shadow: 0 4px 16px rgba(44, 36, 22, 0.1);
+$douluo-shadow-strong: 0 8px 32px rgba(44, 36, 22, 0.2);
+
+// 稀有度色值
+$rarity-sss: #FFD700;
+$rarity-ss: #C77DFF;
+$rarity-s: #9B59B6;
+$rarity-a: #4A90D9;
+$rarity-b: #7ED321;
+$rarity-c: #B0B0B0;

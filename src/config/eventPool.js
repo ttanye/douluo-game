@@ -1,0 +1,4232 @@
+// 统一事件池 — 所有事件带等级门控、触发条件、解锁效果
+// 事件按等级区间组织，由 progress store 动态筛选
+
+import { hasMet, isAlliedWith, isEnemyOf } from './conditions'
+import { adjustCombatWeights } from '../utils/combatPower'
+import { CANON_NPC, getNPCpower } from './npcPower'
+
+/** 战力→魂环年限概率 + 魂骨掉落 */
+function buildRingOptions(state, ringNum, beasts) {
+  const power = state.combatPower || (state.level || 1) * 10
+  const highBonus = Math.floor(power / 80)
+  
+  return beasts.map((b, i) => {
+    let rarity = 'B'
+    let weight = 30
+    let colorName = b.color
+    // 自动推断更细粒度的颜色名
+    if (b.year >= 1000000 || b.color === '百万年' || b.color === '神级') { rarity = 'SSS'; weight = Math.max(1, Math.min(30, highBonus - 8)); colorName = b.color || '百万年' }
+    else if (b.year >= 100000) { rarity = 'SS';  weight = Math.max(2, highBonus - 4); colorName = '十万年' }
+    else if (b.year >= 50000)  { rarity = 'S';   weight = Math.max(3, highBonus - 2); colorName = '五万年' }
+    else if (b.year >= 10000)  { rarity = 'A';   weight = Math.max(5, highBonus); colorName = '万年' }
+    else if (b.year >= 5000)   { rarity = 'A';   weight = 20 - highBonus; colorName = '五千年' }
+    else if (b.year >= 1000)   { rarity = 'B';   weight = 30 - highBonus; colorName = '千年' }
+    else if (b.year >= 500)    { rarity = 'B';   weight = 35; colorName = '百年' }
+    else if (b.year >= 100)    { rarity = 'C';   weight = 30; colorName = '百年' }
+    else                       { rarity = 'C';   weight = 25; colorName = '十年' }
+    
+    // 魂骨掉落概率（年份越高越容易出）
+    const boneChance = b.year >= 1000000 ? 0.40 : b.year >= 100000 ? 0.25 : b.year >= 10000 ? 0.15 : b.year >= 1000 ? 0.08 : b.year >= 100 ? 0.03 : 0.01
+    const hasBone = Math.random() < boneChance
+    const slots = ['head', 'rightArm', 'leftArm', 'torso', 'rightLeg', 'leftLeg']
+    const soulBone = hasBone ? { slot: slots[Math.floor(Math.random() * slots.length)], beast: b.beast, year: b.year, skill: `${b.skill}·骨`, rarity } : null
+    
+    return {
+      label: `${colorName}·${b.beast}`, icon: b.icon, rarity, weight: Math.max(1, Math.floor(weight)),
+      levelBoost: ringNum,
+      soulRing: { year: b.year, colorName, colorHex: b.hex, beast: b.beast, skill: b.skill },
+      soulBone,
+    }
+  })
+}
+
+/**
+ * 事件池条目格式：
+ * {
+ *   id: string,           // 唯一ID
+ *   title: string,        // 标题
+ *   icon: string,         // 图标
+ *   minLevel: number,     // 最低等级
+ *   maxLevel: number,     // 最高等级(可选，100=无上限)
+ *   rarity: string,       // 事件稀有度(影响出现概率)
+ *   requiredEvents: [],   // 前置事件ID(可选)
+ *   excludedEvents: [],   // 互斥事件ID(可选)
+ *   unlocksOnSelect: [],  // 选择后解锁的事件ID(可选)
+ *   // --- 原有步骤配置 ---
+ *   prelude: string,
+ *   resultTemplate: string?,
+ *   suffixes: {},
+ *   computeOptions: (state) => [{ label, icon, rarity, weight, soulRing?, soulBone?, levelBoost?, worldImpact?, unlocks? }],
+ * }
+ */
+
+export const EVENT_POOL = [
+  // ==================== 魂骨猎杀事件（6个，覆盖全等级） ====================
+  {
+    id: 'boneHunt_lv20', title: '🦴 魂骨猎杀·百年', icon: '🦴', minLevel: 18, maxLevel: 30, rarity: 'A', isMilestone: true,
+    prelude: '一头百年魂兽的体内检测到了魂骨反应！虽然年份不高，但魂骨就是魂骨。命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || (state.level||1)*10
+      const pwr = 1 + power / 1000
+      return [
+        { label: '成功猎杀·获得右腿魂骨！！', icon: '🦴', rarity: 'SSS', weight: Math.floor(18*pwr), levelBoost: 3, soulBone: { slot: 'rightLeg', beast: '百年幽冥狼', year: 600, skill: '幽冥步', rarity: 'B' } },
+        { label: '获得左臂魂骨',               icon: '💪', rarity: 'SS', weight: Math.floor(28*pwr), levelBoost: 2, soulBone: { slot: 'leftArm', beast: '百年粉红女郎', year: 700, skill: '毒刺增强', rarity: 'B' } },
+        { label: '魂兽逃走了',                 icon: '🏃', rarity: 'B', weight: Math.max(5, Math.floor(30/pwr)), levelBoost: 1 },
+        { label: '情报有误',                   icon: '😔', rarity: 'C', weight: Math.max(3, Math.floor(24/pwr)) },
+      ]
+    },
+  },
+  {
+    id: 'boneHunt_lv35', title: '🦴 魂骨猎杀·千年', icon: '🦴', minLevel: 30, maxLevel: 45, rarity: 'S', isMilestone: true,
+    prelude: '千年魂兽的魂骨反应！右臂骨或左腿骨——这次猎杀值得冒险。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = 1 + (state.combatPower||(state.level||1)*10) / 1000
+      return [
+        { label: '获得右臂魂骨！！', icon: '🦴', rarity: 'SSS', weight: Math.floor(15*pwr), levelBoost: 4, soulBone: { slot: 'rightArm', beast: '千年麟甲兽', year: 5000, skill: '麟甲护体', rarity: 'A' } },
+        { label: '获得左腿魂骨',     icon: '🦵', rarity: 'SS', weight: Math.floor(25*pwr), levelBoost: 3, soulBone: { slot: 'leftLeg', beast: '千年鬼虎', year: 4000, skill: '鬼虎步', rarity: 'A' } },
+        { label: '获得头部魂骨',     icon: '🧠', rarity: 'S', weight: Math.floor(15*pwr), levelBoost: 3, soulBone: { slot: 'head', beast: '千年凤尾鸡冠蛇', year: 6000, skill: '精神敏锐', rarity: 'A' } },
+        { label: '魂兽逃走了',       icon: '🏃', rarity: 'A', weight: Math.max(5,Math.floor(25/pwr)), levelBoost: 2 },
+        { label: '没有魂骨',         icon: '😔', rarity: 'C', weight: Math.max(3,Math.floor(20/pwr)) },
+      ]
+    },
+  },
+  {
+    id: 'boneHunt_lv50', title: '🦴 魂骨猎杀·万年', icon: '🦴', minLevel: 45, maxLevel: 60, rarity: 'SS', isMilestone: true,
+    prelude: '万年魂骨的传闻——躯干骨！来自万年大地之王。无数魂师蜂拥而至。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得躯干骨！！',       icon: '🦴', rarity: 'SSS', weight: 12, levelBoost: 5, soulBone: { slot: 'torso', beast: '万年大地之王', year: 50000, skill: '大地守护', rarity: 'S' } },
+        { label: '获得头部魂骨',         icon: '🧠', rarity: 'SS', weight: 22, levelBoost: 4, soulBone: { slot: 'head', beast: '万年粉红娘娘', year: 30000, skill: '精神冲击', rarity: 'S' } },
+        { label: '获得右臂魂骨',         icon: '💪', rarity: 'S', weight: 20, levelBoost: 4, soulBone: { slot: 'rightArm', beast: '万年暗金恐爪熊', year: 50000, skill: '暗金恐爪', rarity: 'S' } },
+        { label: '来晚了·被取走',       icon: '⏰', rarity: 'A', weight: 26, levelBoost: 2 },
+        { label: '白跑一趟',             icon: '😤', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'boneHunt_lv65', title: '🦴 魂骨猎杀·五万年', icon: '🦴', minLevel: 60, maxLevel: 75, rarity: 'SS', isMilestone: true,
+    prelude: '五万年魂兽的魂骨现世——据说是来自深海魔鲸的左臂骨！海洋中的至宝。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得左臂魂骨！！',   icon: '💪', rarity: 'SSS', weight: 12, levelBoost: 6, soulBone: { slot: 'leftArm', beast: '五万年深海魔鲸', year: 50000, skill: '深海之力', rarity: 'SS' } },
+        { label: '获得左腿魂骨',       icon: '🦵', rarity: 'SS', weight: 22, levelBoost: 5, soulBone: { slot: 'leftLeg', beast: '五万年邪魔虎鲸', year: 50000, skill: '虎鲸之速', rarity: 'SS' } },
+        { label: '获得躯干骨',         icon: '🦴', rarity: 'S', weight: 20, levelBoost: 5, soulBone: { slot: 'torso', beast: '五万年魔鬼鱼王', year: 50000, skill: '深海屏障', rarity: 'S' } },
+        { label: '被捷足先登',         icon: '😤', rarity: 'A', weight: 26, levelBoost: 2 },
+        { label: '情报假的',           icon: '😔', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'boneHunt_lv80', title: '🦴 魂骨猎杀·十万年', icon: '🦴', minLevel: 75, maxLevel: 90, rarity: 'SSS', isMilestone: true,
+    prelude: '传说中的十万年魂骨——外附魂骨！来自陨落的天青牛蟒。所有魂师梦寐以求的至宝。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = 1 + (state.combatPower||(state.level||1)*10) / 800
+      return [
+        { label: '获得外附魂骨！！',   icon: '🦴', rarity: 'SSS', weight: Math.floor(8*pwr), levelBoost: 8, soulBone: { slot: 'external', beast: '十万年天青牛蟒', year: 100000, skill: '天青之翼', rarity: 'SSS' } },
+        { label: '获得头部魂骨',       icon: '🧠', rarity: 'SS', weight: Math.floor(18*pwr), levelBoost: 6, soulBone: { slot: 'head', beast: '十万年泰坦巨猿', year: 100000, skill: '泰坦意志', rarity: 'SS' } },
+        { label: '获得右臂魂骨',       icon: '💪', rarity: 'S', weight: Math.floor(22*pwr), levelBoost: 6, soulBone: { slot: 'rightArm', beast: '十万年深海魔鲸王', year: 100000, skill: '魔鲸之握', rarity: 'SS' } },
+        { label: '魂兽太强·撤退',     icon: '🏃', rarity: 'A', weight: Math.max(5,Math.floor(30/pwr)), levelBoost: 3 },
+        { label: '情报假的·发现秘境',  icon: '🏞️', rarity: 'B', weight: Math.max(3,Math.floor(22/pwr)), levelBoost: 4 },
+      ]
+    },
+  },
+  {
+    id: 'boneHunt_lv95', title: '🦴 魂骨猎杀·百万年', icon: '🦴', minLevel: 90, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '百万年魂骨——传说中龙神遗留的外附魂骨！这是斗罗大陆上最顶级的魂骨，拥有它的人将获得碾压一切的力量。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得龙神外附魂骨！！', icon: '🦴', rarity: 'SSS', weight: 6, levelBoost: 10, soulBone: { slot: 'external', beast: '百万年龙神', year: 1000000, skill: '龙神之翼', rarity: 'SSS' } },
+        { label: '获得头部魂骨',         icon: '🧠', rarity: 'SS', weight: 16, levelBoost: 8, soulBone: { slot: 'head', beast: '百万年冰龙神', year: 1000000, skill: '冰龙神念', rarity: 'SSS' } },
+        { label: '获得躯干骨',           icon: '🦴', rarity: 'S', weight: 20, levelBoost: 7, soulBone: { slot: 'torso', beast: '百万年天梦冰蚕', year: 1000000, skill: '冰蚕神衣', rarity: 'SS' } },
+        { label: '龙神残魂太强·撤退',   icon: '🏃', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '情报假的·发现神迹',    icon: '✨', rarity: 'B', weight: 30, levelBoost: 5 },
+      ]
+    },
+  },
+
+  // ==================== 魂环里程碑 ====================
+  {
+    id: 'ring_lv10', title: '💍 第一魂环', icon: '💍', minLevel: 9, maxLevel: 16, rarity: 'SSS', isMilestone: true,
+    prelude: '10级！获取第一魂环的时刻。以你目前的实力，能猎取什么年份的魂兽？命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 1, [
+      { beast: '远古龙种',     year: 800000, color: '百万年', icon: '🐉', hex: '#FFD700', skill: '远古龙息' },
+      { beast: '天青牛蟒幼体', year: 80000,  color: '十万年', icon: '🐂', hex: '#FF1744', skill: '天青寂灭' },
+      { beast: '曼陀罗蛇',     year: 4000,   color: '千年',   icon: '🐍', hex: '#7B1FA2', skill: '曼陀罗蛇缚' },
+      { beast: '凤尾鸡冠蛇',   year: 2500,   color: '千年',   icon: '🐔', hex: '#7B1FA2', skill: '凤翔闪' },
+      { beast: '幻影狐',       year: 1200,   color: '千年',   icon: '🦊', hex: '#7B1FA2', skill: '幻影分身' },
+      { beast: '幽冥狼',       year: 400,    color: '百年',   icon: '🐺', hex: '#F9A825', skill: '幽冥狼爪' },
+      { beast: '噬金鼠',       year: 800,    color: '百年',   icon: '🐭', hex: '#F9A825', skill: '金噬' },
+      { beast: '鬼藤',         year: 600,    color: '百年',   icon: '🌿', hex: '#F9A825', skill: '藤缚' },
+      { beast: '铁甲野猪',     year: 200,    color: '百年',   icon: '🐗', hex: '#F9A825', skill: '野蛮冲撞' },
+      { beast: '柔骨兔',       year: 30,     color: '十年',   icon: '🐰', hex: '#EEEEEE', skill: '柔骨兔蹬' },
+    ])},
+  },
+  {
+    id: 'ring_lv20', title: '💍 第二魂环', icon: '💍', minLevel: 17, maxLevel: 28, rarity: 'SSS', isMilestone: true,
+    prelude: '20级！第二魂环的猎取需要更强的魂兽。命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 2, [
+      { beast: '深海魔鲸王',   year: 900000, color: '百万年', icon: '🐋', hex: '#FFD700', skill: '武魂真身·魔鲸' },
+      { beast: '邪魔虎鲸王',   year: 90000,  color: '五万年', icon: '🦈', hex: '#4A148C', skill: '武魂真身·虎鲸' },
+      { beast: '地穴魔蛛',     year: 30000,  color: '五万年', icon: '🕷️', hex: '#4A148C', skill: '蛛网束缚' },
+      { beast: '人面魔蛛',     year: 6000,   color: '五千年', icon: '🕸️', hex: '#7B1FA2', skill: '剧毒蛛网' },
+      { beast: '鬼虎',         year: 3000,   color: '千年',   icon: '🐯', hex: '#7B1FA2', skill: '虎啸' },
+      { beast: '闪电隼',       year: 2500,   color: '千年',   icon: '🦅', hex: '#7B1FA2', skill: '闪电突袭' },
+      { beast: '铁甲熊',       year: 800,    color: '百年',   icon: '🐻', hex: '#F9A825', skill: '铁甲冲撞' },
+      { beast: '粉红女郎',     year: 500,    color: '百年',   icon: '🦂', hex: '#F9A825', skill: '毒刺' },
+      { beast: '毒尾蝎',       year: 200,    color: '百年',   icon: '🦂', hex: '#F9A825', skill: '蝎尾毒针' },
+      { beast: '竹叶青',       year: 80,     color: '十年',   icon: '🐍', hex: '#EEEEEE', skill: '竹叶青咬' },
+    ])},
+  },
+  {
+    id: 'ring_lv30', title: '💍 第三魂环', icon: '💍', minLevel: 27, maxLevel: 38, rarity: 'SSS', isMilestone: true,
+    prelude: '30级！你需要一枚更强大的魂环来突破瓶颈。命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 3, [
+      { beast: '泰坦巨猿',     year: 80000,  color: '十万年', icon: '🦍', hex: '#FF1744', skill: '泰坦之力' },
+      { beast: '大地之王',     year: 40000,  color: '五万年', icon: '🦂', hex: '#4A148C', skill: '岩浆喷涌' },
+      { beast: '凤尾鸡冠蛇',   year: 5000,   color: '五千年', icon: '🐔', hex: '#7B1FA2', skill: '凤翔' },
+      { beast: '麟甲兽',       year: 3500,   color: '千年',   icon: '🦎', hex: '#7B1FA2', skill: '麟甲护体' },
+      { beast: '鬼藤',         year: 700,    color: '百年',   icon: '🌿', hex: '#F9A825', skill: '缠绕' },
+      { beast: '铁甲犀牛',     year: 1500,   color: '千年',   icon: '🦏', hex: '#7B1FA2', skill: '犀牛冲撞' },
+      { beast: '赤练蛇',       year: 400,    color: '百年',   icon: '🐍', hex: '#F9A825', skill: '赤练毒牙' },
+      { beast: '岩甲龟',       year: 900,    color: '百年',   icon: '🐢', hex: '#F9A825', skill: '岩甲防御' },
+      { beast: '大地鼠',       year: 120,    color: '百年',   icon: '🐀', hex: '#F9A825', skill: '遁地' },
+      { beast: '板甲巨犀',     year: 20000,  color: '万年',   icon: '🦏', hex: '#212121', skill: '战争践踏' },
+    ])},
+  },
+  {
+    id: 'ring_lv40', title: '💍 第四魂环', icon: '💍', minLevel: 36, maxLevel: 48, rarity: 'SSS', isMilestone: true,
+    prelude: '40级！第四魂环是你实力质变的开始。命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 4, [
+      { label: '', icon: '🦂', beast: '大地之王', year: 40000, color: '万年', hex: '#212121', skill: '岩浆喷涌' },
+      { label: '', icon: '🦋', beast: '粉红娘娘', year: 8000,  color: '千年', hex: '#7B1FA2', skill: '迷幻花粉' },
+      { label: '', icon: '🐭', beast: '噬金鼠',   year: 4000,  color: '千年', hex: '#7B1FA2', skill: '金属吞噬' },
+    ])},
+  },
+  {
+    id: 'ring_lv50', title: '💍 第五魂环', icon: '💍', minLevel: 47, maxLevel: 56, rarity: 'SSS', isMilestone: true,
+    prelude: '50级！第五魂环——魂王境界的关键一环！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 5, [
+      { label: '', icon: '🐋', beast: '深海魔鲸',   year: 90000, color: '万年', hex: '#212121', skill: '深海之怒' },
+      { label: '', icon: '🐯', beast: '暗魔邪神虎', year: 50000, color: '万年', hex: '#212121', skill: '暗魔邪光' },
+      { label: '', icon: '🐻', beast: '大地熊王',   year: 9000,  color: '千年', hex: '#7B1FA2', skill: '大地震' },
+    ])},
+  },
+  {
+    id: 'ring_lv60', title: '💍 第六魂环', icon: '💍', minLevel: 57, maxLevel: 66, rarity: 'SSS', isMilestone: true,
+    prelude: '60级！第六魂环——魂帝的标志！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 6, [
+      { label: '', icon: '🐂', beast: '天青牛蟒', year: 100000, color: '十万年', hex: '#FF1744', skill: '天青寂灭' },
+      { label: '', icon: '🐯', beast: '邪眸白虎', year: 60000,  color: '万年',   hex: '#212121', skill: '白虎流星雨' },
+      { label: '', icon: '🧊', beast: '冰凤凰',   year: 9000,   color: '千年',   hex: '#7B1FA2', skill: '冰雪风暴' },
+    ])},
+  },
+  {
+    id: 'ring_lv70', title: '💍 第七魂环·武魂真身', icon: '💍', minLevel: 67, maxLevel: 76, rarity: 'SSS', isMilestone: true,
+    prelude: '70级！武魂真身的觉醒——第七魂环至关重要！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 7, [
+      { label: '', icon: '🐋', beast: '深海魔鲸王', year: 1000000, color: '百万年', hex: '#FFD700', skill: '武魂真身·魔鲸' },
+      { label: '', icon: '🦈', beast: '邪魔虎鲸王', year: 100000,  color: '十万年', hex: '#FF1744', skill: '武魂真身·虎鲸' },
+      { label: '', icon: '🦇', beast: '魔鬼鱼王',   year: 70000,   color: '万年',   hex: '#212121', skill: '武魂真身·魔鬼鱼' },
+    ])},
+  },
+  {
+    id: 'ring_lv80', title: '💍 第八魂环', icon: '💍', minLevel: 77, maxLevel: 86, rarity: 'SSS', isMilestone: true,
+    prelude: '80级！第八魂环——魂斗罗的最后一环！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 8, [
+      { label: '', icon: '🧊', beast: '泰坦雪魔', year: 100000, color: '十万年', hex: '#FF1744', skill: '冰封万里' },
+      { label: '', icon: '🐜', beast: '千钧蚁皇', year: 80000,  color: '万年',   hex: '#212121', skill: '千钧之力' },
+      { label: '', icon: '🧸', beast: '金刚熊王', year: 60000,  color: '万年',   hex: '#212121', skill: '金刚不坏' },
+    ])},
+  },
+  {
+    id: 'ring_lv90', title: '💍 第九魂环·封号之证', icon: '💍', minLevel: 87, maxLevel: 96, rarity: 'SSS', isMilestone: true,
+    prelude: '90级！封号斗罗的最后一块拼图——第九魂环！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 9, [
+      { label: '', icon: '🐉', beast: '龙神残魂', year: 1000000, color: '百万年', hex: '#FFD700', skill: '龙神变' },
+      { label: '', icon: '🐛', beast: '天梦冰蚕', year: 100000,  color: '十万年', hex: '#FF1744', skill: '冰蚕神丝' },
+      { label: '', icon: '🦂', beast: '大地之王', year: 90000,   color: '万年',   hex: '#212121', skill: '大地之怒' },
+    ])},
+  },
+  {
+    id: 'ring_lv100', title: '💍 第十魂环·神级', icon: '💍', minLevel: 95, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '100级！凡人的极限——第十魂环必须是神级！命运之轮，请转动——',
+    computeOptions(state) { return buildRingOptions(state, 10, [
+      { label: '', icon: '🐉', beast: '龙神核心', year: 10000000, color: '神级', hex: '#FFD700', skill: '龙神降临' },
+      { label: '', icon: '✨', beast: '神赐魂兽', year: 999999,   color: '神赐', hex: '#FFD700', skill: '神灵庇护' },
+      { label: '', icon: '⭐', beast: '伪神魂兽', year: 99000,    color: '万年', hex: '#212121', skill: '伪神之力' },
+    ])},
+  },
+
+  // ==================== 等级里程碑事件 ====================
+  {
+    id: 'milestone_lv20', title: '🔷 瓶颈突破', icon: '🧱', minLevel: 19, maxLevel: 22, rarity: 'SSS', isMilestone: true,
+    prelude: '你感到体内的魂力达到了一个临界点——这是你魂师生涯中的第一道真正的瓶颈。突破它，你将踏入全新的境界！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美突破·经脉全开',   icon: '✨', rarity: 'SSS', weight: 10, levelBoost: 5 },
+        { label: '借助外力·丹药辅助',   icon: '💊', rarity: 'A', weight: 25, levelBoost: 3 },
+        { label: '苦修突破·水到渠成',   icon: '💪', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '濒临走火·但因祸得福', icon: '🔥', rarity: 'S', weight: 15, levelBoost: 4 },
+        { label: '突破失败·但积累经验', icon: '📈', rarity: 'C', weight: 20, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'milestone_lv40', title: '🔷 武魂进化', icon: '🦋', minLevel: 39, maxLevel: 43, rarity: 'SSS', isMilestone: true,
+    prelude: '你的武魂在40级这个节点产生了质变！它开始吸收你一路走来的所有战斗经验，进行自我进化——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '武魂完美进化·品质飞跃',   icon: '🌟', rarity: 'SSS', weight: 8, levelBoost: 6 },
+        { label: '觉醒第二形态·战力倍增',   icon: '⚡', rarity: 'SS', weight: 20, levelBoost: 5 },
+        { label: '稳定进化·根基扎实',       icon: '✅', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '进化方向偏移·但获得新能力', icon: '🔄', rarity: 'S', weight: 22, levelBoost: 4 },
+        { label: '进化受阻·但武魂更坚韧',    icon: '🛡️', rarity: 'B', weight: 20, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'milestone_lv60', title: '🔷 武魂真身', icon: '🦸', minLevel: 59, maxLevel: 63, rarity: 'SSS', isMilestone: true,
+    prelude: '武魂真身——六环魂帝的标志！你的武魂将第一次以真身形态降临世间。这一刻，你等了太久！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美真身·武魂具象化！！',   icon: '💫', rarity: 'SSS', weight: 10, levelBoost: 7 },
+        { label: '真身降临·战力飙升',         icon: '💪', rarity: 'SS', weight: 25, levelBoost: 5 },
+        { label: '真身成形·根基稳固',         icon: '🦾', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '真身暴走·但被压制后更强',   icon: '🌀', rarity: 'S', weight: 20, levelBoost: 5 },
+        { label: '真身失败·但魂力结构优化',   icon: '🔧', rarity: 'B', weight: 15, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'milestone_lv80', title: '🔷 封号之路', icon: '👑', minLevel: 79, maxLevel: 83, rarity: 'SSS', isMilestone: true,
+    prelude: '八环魂斗罗！封号斗罗只有一步之遥。但这一步之遥，困住了古往今来无数天才。你必须找到属于自己的"道"——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '悟道成功·封号之路大开',   icon: '💡', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '战斗中顿悟·以战入道',     icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '借鉴前人·站在巨人肩上',   icon: '📖', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '还差一点·但快了',         icon: '⏳', rarity: 'B', weight: 25, levelBoost: 2 },
+        { label: '走入歧途·但发现新路',     icon: '🌿', rarity: 'S', weight: 15, levelBoost: 5 },
+      ]
+    },
+  },
+  {
+    id: 'milestone_lv90', title: '🔷 神位感应', icon: '🔱', minLevel: 89, maxLevel: 93, rarity: 'SSS', isMilestone: true,
+    prelude: '封号斗罗之上，是神！你第一次清晰地感受到了神界的存在——那是更高层次的力量。你的神位传承，正在觉醒——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '神位觉醒·传承显现！！', icon: '🌟', rarity: 'SSS', weight: 12, levelBoost: 6, weapon: { name: '封号之证', power: 200, rarity: 'SSS', source: '神位传承' } },
+        { label: '感应明确·方向清晰',     icon: '🧭', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '朦胧感应·还需历练',     icon: '🌫️', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '多个神位同时召唤',       icon: '🎭', rarity: 'S', weight: 20, levelBoost: 5 },
+        { label: '感应微弱·但心中有火',   icon: '🕯️', rarity: 'B', weight: 15, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'milestone_lv100', title: '🔷 最终觉醒', icon: '💫', minLevel: 99, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '100级！凡人的极限！神的起点！你的身体、武魂、灵魂——一切都在这一刻达到了最完美的状态。最终觉醒，在此一举！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完全觉醒·踏入神之领域！！', icon: '✨', rarity: 'SSS', weight: 20, levelBoost: 5 },
+        { label: '觉醒成功·神位稳固',         icon: '✅', rarity: 'SS', weight: 35, levelBoost: 3 },
+        { label: '觉醒中看到前世今生',        icon: '🔄', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '觉醒太强·暂时封印部分力量', icon: '🔐', rarity: 'A', weight: 15, levelBoost: 2 },
+        { label: '觉醒失败·但已知天命',       icon: '📜', rarity: 'B', weight: 5 },
+      ]
+    },
+  },
+
+  // ==================== Lv.1-10: 初入魂师界 ====================
+  {
+    id: 'firstAwakening', title: '武魂觉醒仪式', icon: '✨', minLevel: 1, maxLevel: 99, rarity: 'A',
+    prelude: '诺丁城武魂殿分殿中，觉醒仪式正在进行。你走上前去，将手放在了觉醒水晶上……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美觉醒·光芒万丈', icon: '🌟', rarity: 'SSS', weight: 1 },
+        { label: '顺利觉醒·魂力涌动', icon: '💡', rarity: 'A', weight: 25 },
+        { label: '正常觉醒·平凡之路', icon: '🔮', rarity: 'B', weight: 35 },
+        { label: '困难觉醒·险些失败', icon: '😰', rarity: 'C', weight: 25 },
+        { label: '变异觉醒·异象突生', icon: '🌀', rarity: 'SS', weight: 4 },
+        { label: '失败·沦为废人',     icon: '💔', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'firstTeacher', title: '第一位老师', icon: '👨‍🏫', minLevel: 1, maxLevel: 30, rarity: 'A',
+    requiredEvents: ['firstAwakening'],
+    prelude: '觉醒之后，一位穿着朴素的中年人找到了你。"我叫玉小刚，他们都叫我大师。你的先天魂力不错——愿意跟我学习吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      const innate = parseInt((state.attributes?.innatePower || '').match(/[0-9]+/)?.[0]) || 0
+      const hasBoost = innate >= 8
+      return [
+        { label: '拜大师为师·接受特训',       icon: '📖', rarity: 'SSS', weight: hasBoost ? 25 : 15, levelBoost: 3, unlocks: ['masterPath'], worldImpact: { yuXiaoGang: { met: true, affinity: 25 } } },
+        { label: '质疑他·武魂废物的理论？',   icon: '🤨', rarity: 'S',   weight: 10, levelBoost: 1, worldImpact: { yuXiaoGang: { met: true, affinity: -5 } } },
+        { label: '入学诺丁学院·正常途径',     icon: '🏫', rarity: 'A',   weight: 28, levelBoost: 1 },
+        { label: '一位退役魂师愿意教你',       icon: '🧓', rarity: 'B',   weight: 22 },
+        { label: '自学成才·靠自己的努力',     icon: '📚', rarity: 'C',   weight: innate >= 5 ? 10 : 25 },
+      ]
+    },
+  },
+  {
+    id: 'firstBattle', title: '第一场战斗', icon: '⚔️', minLevel: 1, maxLevel: 30, rarity: 'B', enemyPower: CANON_NPC.beast_10yr,
+    requiredEvents: ['firstAwakening'],
+    prelude: '一只十年魂兽出现在你面前！这是你的第一次实战……命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '正面硬刚·碾压破敌',   icon: '💪', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '智取弱点·精准取胜',   icon: '🧠', rarity: 'A', weight: 22, levelBoost: 2 },
+        { label: '防守反击·稳扎稳打',   icon: '🛡️', rarity: 'A', weight: 20, levelBoost: 1 },
+        { label: '力量不够·积累了经验', icon: '📈', rarity: 'C', weight: 18, levelBoost: 0.5 },
+        { label: '燃烧魂力·透支换来速胜', icon: '🔥', rarity: 'S', weight: 10, levelBoost: 3, worldImpact: { self: { exhausted: true } } },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, CANON_NPC.beast_10yr)
+    },
+  },
+  // 早期补充事件（无前置，减缓重复感）
+  {
+    id: 'childhoodMemory', title: '童年的记忆', icon: '🧒', minLevel: 1, maxLevel: 12, rarity: 'B',
+    prelude: '你隐约记得小时候——在村子里的日子。那些关于魂师的传说，那些星空下的梦想……它们是你踏上这条路的初心。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '回忆起父亲留下的修炼笔记', icon: '📓', rarity: 'SS', weight: 12, levelBoost: 2 },
+        { label: '想起母亲讲过的武魂故事',   icon: '💬', rarity: 'A', weight: 25, levelBoost: 1 },
+        { label: '模糊的温暖记忆',           icon: '🏠', rarity: 'B', weight: 33, levelBoost: 1 },
+        { label: '什么都不记得了',           icon: '🌫️', rarity: 'C', weight: 30 },
+      ]
+    },
+  },
+  {
+    id: 'villageMarket', title: '村里的市集', icon: '🏪', minLevel: 1, maxLevel: 12, rarity: 'B',
+    prelude: '诺丁城外的村庄市集上，商贩的叫卖声此起彼伏。你偶然在一个旧货摊前停下脚步……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '淘到一本泛黄的魂师手册', icon: '📖', rarity: 'SS', weight: 12, levelBoost: 2 },
+        { label: '买到一颗劣质的魂力丹',   icon: '💊', rarity: 'A', weight: 25, levelBoost: 1 },
+        { label: '什么都没买·只是闲逛',   icon: '🚶', rarity: 'B', weight: 33 },
+        { label: '被小偷偷了钱包',         icon: '😤', rarity: 'C', weight: 30 },
+      ]
+    },
+  },
+  {
+    id: 'firstEncounter', title: '初遇', icon: '👋', minLevel: 1, maxLevel: 25, rarity: 'S',
+    requiredEvents: ['firstAwakening'], exclusiveGroup: 'firstContact',
+    prelude: '诺丁学院宿舍里，一个粉裙少女闯了进来。"谁是这里的老大？"她叉着腰，丝毫不把一屋子男生放在眼里。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '与她打了一架·不打不相识', icon: '🥊', rarity: 'SSS', weight: 18, worldImpact: { xiaoWu: { met: true, affinity: 15, faction: 'friend' } }, unlocks: ['xiaoWuPath'] },
+        { label: '微笑欢迎·主动让出床位',   icon: '😊', rarity: 'SS',  weight: 15, worldImpact: { xiaoWu: { met: true, affinity: 10 } }, unlocks: ['xiaoWuPath'] },
+        { label: '唐三出面·调和两人',       icon: '🌿', rarity: 'S',   weight: 22, worldImpact: { tangSan: { met: true, affinity: 5 }, xiaoWu: { met: true, affinity: 5 } }, unlocks: ['tangSanPath'] },
+        { label: '一旁观望·暗中佩服',       icon: '👀', rarity: 'A',   weight: 20 },
+        { label: '帮她说话·指责欺负女孩',   icon: '🛡️', rarity: 'S', weight: 10, worldImpact: { xiaoWu: { met: true, affinity: 8 } } },
+        { label: '玉小刚路过·记住了你',     icon: '📖', rarity: 'SS',  weight: 8, worldImpact: { yuXiaoGang: { met: true, affinity: 5 } } },
+        { label: '出去找老师·不想惹麻烦',   icon: '🏃', rarity: 'C',   weight: 7 },
+      ]
+    },
+  },
+
+  // ==================== 诺丁学院早期 ====================
+  {
+    id: 'nottingDorm', title: '宿舍老大', icon: '💪', minLevel: 4, maxLevel: 15, rarity: 'A', enemyPower: 20,
+    prelude: '诺丁学院的宿舍里，老生王圣正在欺负新生。"新来的，以后这里我说了算！"你攥紧了拳头……命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '一拳打倒王圣·碾压取胜！！', icon: '👊', rarity: 'SSS', weight: 12, levelBoost: 3 },
+        { label: '三招取胜·赢得尊重',       icon: '⚔️', rarity: 'SS',  weight: 18, levelBoost: 2 },
+        { label: '与唐三联手·打服所有人',   icon: '🤝', rarity: 'S',   weight: 15, levelBoost: 2, worldImpact: { tangSan: { met: true, affinity: 8 } } },
+        { label: '忍让·但心中立下目标',     icon: '🎯', rarity: 'A',   weight: 25, levelBoost: 1 },
+        { label: '被打了一顿·但没哭',       icon: '😤', rarity: 'B',   weight: 20 },
+        { label: '告老师',                   icon: '📢', rarity: 'C',   weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 20)
+    },
+  },
+
+  // ==================== Lv.11-20: 诺丁学院 ====================
+  {
+    id: 'roommate', title: '室友', icon: '🛏️', minLevel: 11, maxLevel: 20, rarity: 'B',
+    prelude: '学院宿舍分配……你的室友会是谁？命运之轮，请转动——',
+    computeOptions(state) {
+      const metTangSan = hasMet('tangSan')(state)
+      return [
+        { label: '唐三（如果同代）', icon: '🌿', rarity: 'SSS', weight: metTangSan ? 30 : 5, worldImpact: { tangSan: { met: true, affinity: 15 } } },
+        { label: '勤奋的平民学生', icon: '💪', rarity: 'B', weight: 25 },
+        { label: '贵族子弟',       icon: '👑', rarity: 'A', weight: 20 },
+        { label: '不学无术的混子', icon: '😴', rarity: 'C', weight: 25 },
+        { label: '独自一间',       icon: '🏠', rarity: 'B', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'rival', title: '劲敌', icon: '🥊', minLevel: 12, maxLevel: 20, rarity: 'A', enemyPower: 100,
+    prelude: '学院中出现了你的对手……命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '天才少年·正面碾压',       icon: '⚡', rarity: 'SS', weight: 8, levelBoost: 3 },
+        { label: '贵族天才·一番苦战胜之',   icon: '⚔️', rarity: 'A', weight: 22, levelBoost: 2 },
+        { label: '平民强者·惺惺相惜',       icon: '🤝', rarity: 'S', weight: 15, levelBoost: 1 },
+        { label: '遭小人暗算·但化险为夷',   icon: '🐍', rarity: 'A', weight: 25 },
+        { label: '惜败·但学到了很多',       icon: '😔', rarity: 'B', weight: 20 },
+        { label: '惨败·被当众羞辱',         icon: '😢', rarity: 'C', weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 100)
+    },
+  },
+  {
+    id: 'secretTraining', title: '秘密修行', icon: '🔒', minLevel: 13, maxLevel: 22, rarity: 'S',
+    prelude: '你发现了一个秘密修炼方法……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '远古冥想术', icon: '🧘', rarity: 'SSS', weight: 2, levelBoost: 3 },
+        { label: '极限训练法', icon: '🏋️', rarity: 'A', weight: 25, levelBoost: 1 },
+        { label: '药物辅助',   icon: '🧪', rarity: 'B', weight: 30 },
+        { label: '偷师他人',   icon: '👀', rarity: 'S', weight: 10, levelBoost: 2 },
+        { label: '按部就班',   icon: '📋', rarity: 'C', weight: 33 },
+      ]
+    },
+  },
+  {
+    id: 'tournament', title: '学院比武', icon: '🏆', minLevel: 15, maxLevel: 22, rarity: 'A', enemyPower: 80,
+    prelude: '诺丁学院年度比武大会开始了！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '碾压夺冠·一战成名',     icon: '🥇', rarity: 'SSS', weight: 5, levelBoost: 4 },
+        { label: '亚军·苦战后虽败犹荣',   icon: '🥈', rarity: 'SS',  weight: 12, levelBoost: 2 },
+        { label: '四强·实力不俗',         icon: '🏅', rarity: 'S',   weight: 20, levelBoost: 1 },
+        { label: '八强',                   icon: '📛', rarity: 'A',   weight: 28 },
+        { label: '首轮淘汰·惨败',               icon: '😞', rarity: 'B',   weight: 25 },
+        { label: '因伤退赛',               icon: '🤕', rarity: 'C',   weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 80)
+    },
+  },
+  {
+    id: 'graduation', title: '毕业去向', icon: '🎓', minLevel: 18, maxLevel: 25, rarity: 'S', exclusiveGroup: 'factionChoice',
+    prelude: '诺丁学院的学业即将结束。三条道路摆在面前——每一条都将彻底改变你的命运。命运之轮，请转动——',
+    computeOptions(state) {
+      const metTangSan = hasMet('tangSan')(state)
+      return [
+        { label: '史莱克学院·怪物之路',   icon: '🏫', rarity: 'SSS', weight: metTangSan ? 30 : 15, levelBoost: 3, unlocks: ['shrekPath'] },
+        { label: '武魂殿学院·权力之路',   icon: '⛪', rarity: 'SS', weight: 18, levelBoost: 3, unlocks: ['wuHunAcademyPath'] },
+        { label: '独自游历·自由之路',     icon: '🗺️', rarity: 'S', weight: 25, levelBoost: 2, unlocks: ['wandererPath'] },
+        { label: '天斗皇家学院·贵族之路', icon: '👑', rarity: 'A', weight: 22, levelBoost: 2 },
+        { label: '留校任教·传承之路',     icon: '📖', rarity: 'A', weight: 10, levelBoost: 1 },
+        { label: '回家种地·平凡之路',     icon: '🌾', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+
+  // ==================== Lv.21-30: 星斗大森林 ====================
+  {
+    id: 'enterForest', title: '踏入森林', icon: '🌲', minLevel: 21, maxLevel: 32, rarity: 'A', enemyPower: 150,
+    prelude: '星斗大森林——斗罗大陆最危险的魂兽聚集地。你深吸一口气，踏入了这片古老的森林……命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击退万年魂兽·惊险取胜！！',   icon: '🐉', rarity: 'SS', weight: 8, levelBoost: 3 },
+        { label: '发现仙草·天材地宝',       icon: '🌿', rarity: 'SSS', weight: 3, levelBoost: 3 },
+        { label: '救助受伤魂师·获得指引',   icon: '🩹', rarity: 'A', weight: 22, levelBoost: 1 },
+        { label: '成功深入·平安寻猎',       icon: '🚶', rarity: 'B', weight: 35 },
+        { label: '迷路·但误入秘境',         icon: '🧭', rarity: 'S', weight: 8, levelBoost: 2 },
+        { label: '遭遇魂兽群·狼狈逃跑',     icon: '🏃', rarity: 'C', weight: 12 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 150)
+    },
+  },
+  {
+    id: 'xiaoWuEncounter', title: '林中少女', icon: '🐰', minLevel: 23, maxLevel: 35, rarity: 'SS',
+    requiredEvents: ['enterForest'],
+    prelude: '密林深处，你看到一个粉色长裙的少女正在与魂兽对峙……命运之轮，请转动——',
+    computeOptions(state) {
+      const metBefore = hasMet('xiaoWu')(state)
+      if (metBefore) {
+        return [
+          { label: '再次并肩作战·羁绊加深', icon: '🤝', rarity: 'SSS', weight: 30, worldImpact: { xiaoWu: { affinity: 25, faction: 'friend' } } },
+          { label: '默默守护她', icon: '🛡️', rarity: 'S', weight: 25, worldImpact: { xiaoWu: { affinity: 10 } } },
+          { label: '产生了误会', icon: '😤', rarity: 'B', weight: 25, worldImpact: { xiaoWu: { affinity: -15 } } },
+        ]
+      }
+      return [
+        { label: '出手相助·初次见面', icon: '🤝', rarity: 'SSS', weight: 25, worldImpact: { xiaoWu: { met: true, affinity: 20, faction: 'friend' } }, unlocks: ['xiaoWuPath'] },
+        { label: '袖手旁观', icon: '👀', rarity: 'C', weight: 20 },
+        { label: '叫来其他人帮忙', icon: '📢', rarity: 'B', weight: 25 },
+        { label: '暗中观察', icon: '🕵️', rarity: 'A', weight: 30 },
+      ]
+    },
+  },
+  // ⚡ 小舞献祭 — 仅当已遇到小舞
+  {
+    id: 'xiaoWuSacrifice', title: '⚡ 命运交织：献祭', icon: '🔥', minLevel: 25, maxLevel: 38, rarity: 'SSS',
+    requiredEvents: ['xiaoWuEncounter'],
+    prelude: '突然！武魂殿的封号斗罗出现了——他们的目标是那个粉裙少女！她的真实身份是十万年魂兽化形！你……命运之轮，请转动——',
+    resultTemplate: '{label}\n\n{suffix}',
+    suffixes: {
+      SSS: '你燃烧了自己的魂骨，以命换命！少女哭泣着抱住了倒下的你……但命运之线被改写了！',
+      SS: '你挡在了她面前！虽然受了重伤，但她活了下来。这份恩情，永生难忘——',
+      S: '你制造了混乱，帮助她逃离。武魂殿对你产生了敌意，但你救了一个生命。',
+      A: '你选择了明哲保身，暗中联系了援军……但为时已晚。',
+      B: '你没有出手。命运的齿轮沿着原来的轨迹转动……',
+      C: '你站在了武魂殿一边！这是你一生中最大的污点——',
+    },
+    computeOptions(state) {
+      const isFriend = isAlliedWith('xiaoWu')(state)
+      return [
+        { label: '以命换命·献祭自己', icon: '💔', rarity: 'SSS', weight: isFriend ? 8 : 1, levelBoost: 8,
+          worldImpact: { xiaoWu: { alive: true, sacrificed: false, affinity: 100, faction: 'friend' }, biBiDong: { affinity: -30 } } },
+        { label: '出手相助·共同抗敌', icon: '⚔️', rarity: 'SS', weight: isFriend ? 20 : 5, levelBoost: 5,
+          worldImpact: { xiaoWu: { alive: true, sacrificed: false, affinity: 50 }, biBiDong: { affinity: -20 } } },
+        { label: '制造混乱·帮助逃跑', icon: '💨', rarity: 'S', weight: 25, levelBoost: 3,
+          worldImpact: { xiaoWu: { alive: true, sacrificed: false, affinity: 30 } } },
+        { label: '袖手旁观·无力回天', icon: '😔', rarity: 'A', weight: 30,
+          worldImpact: { xiaoWu: { alive: false, sacrificed: true }, tangSan: { affinity: -30 } } },
+        { label: '帮助武魂殿', icon: '👿', rarity: 'C', weight: 10,
+          worldImpact: { xiaoWu: { alive: false, sacrificed: true }, tangSan: { affinity: -100, faction: 'enemy' }, biBiDong: { affinity: 30 } } },
+      ]
+    },
+  },
+  // ⚡ 冰火两仪眼 — 特定等级+种族条件
+  {
+    id: 'iceFireWell', title: '⚡ 冰火两仪眼', icon: '🌡️', minLevel: 28, maxLevel: 60, rarity: 'SSS',
+    requiredEvents: ['enterForest'],
+    prelude: '在森林最深处，你发现了传说中的冰火两仪眼！"小辈，你可知这里是什么地方？"——毒斗罗独孤博！命运之轮，请转动——',
+    resultTemplate: '{label}！{suffix}',
+    suffixes: {
+      SSS: '独孤博收你为记名弟子！奇茸通天菊和八瓣仙兰的馈赠！等级飙升！',
+      SS: '独孤博允许你在冰火两仪眼修炼一日！魂力大增——',
+      S: '你凭借武魂的特殊性，成功抵御了毒雾，获得了一株珍贵仙草！',
+      A: '你在独孤博的默许下采集了一些仙草。虽然不多，但已是天大的机缘。',
+      B: '独孤博没有为难你，但也未给予帮助。你只能在外围采集了些许药草。',
+      C: '毒雾弥漫，你不得不远远避开。',
+    },
+    computeOptions(state) {
+      const isPoisonRelated = (state.attributes?.soulType || '').includes('碧磷蛇皇') || (state.attributes?.soulType || '').includes('九心海棠')
+      const highInnate = (parseInt((state.attributes?.innatePower || '').match(/[0-9]+/)?.[0]) || 0) >= 8
+      return [
+        { label: '独孤博收为记名弟子·仙草馈赠', icon: '🧪', rarity: 'SSS', weight: isPoisonRelated ? 8 : (highInnate ? 4 : 1), levelBoost: 8,
+          worldImpact: { duGuBo: { met: true, affinity: 30 } } },
+        { label: '获准修炼一日·魂力大增', icon: '💪', rarity: 'SS', weight: 10, levelBoost: 5 },
+        { label: '抵御毒雾·夺得仙草', icon: '🌿', rarity: 'S', weight: isPoisonRelated ? 25 : 15, levelBoost: 3 },
+        { label: '默许采集·小有收获', icon: '🌱', rarity: 'A', weight: 28, levelBoost: 1 },
+        { label: '外围采药·聊胜于无', icon: '🍃', rarity: 'B', weight: 26 },
+        { label: '毒雾太浓·远远观望', icon: '☠️', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+
+  // ==================== Lv.31-50: 史莱克+精英赛 ====================
+  {
+    id: 'shrek_running', title: '🏃 大师的负重晨跑', icon: '🪨', minLevel: 32, maxLevel: 42, rarity: 'A',
+    prelude: '凌晨四点，大师敲响了宿舍门。"每人背一块石头，绕城跑十圈。跑不完别想吃早饭。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '咬牙坚持·体力大幅提升',   icon: '💪', rarity: 'SS',  weight: 15, levelBoost: 3 },
+        { label: '紧跟唐三·互相鼓励跑完',   icon: '🤝', rarity: 'SSS', weight: 18, levelBoost: 2, worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '勉强完成·倒在终点线',     icon: '😵', rarity: 'A',   weight: 30, levelBoost: 1 },
+        { label: '半路偷懒·被大师发现加罚', icon: '😰', rarity: 'B',   weight: 22 },
+        { label: '直接装病请假',             icon: '🤒', rarity: 'C',   weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'shrek_sparring', title: '🥊 七怪混战', icon: '👥', minLevel: 35, maxLevel: 48, rarity: 'S', enemyPower: 250,
+    prelude: '赵无极拍了拍手："今天不讲课——实战！你们六个一起上，能碰到我就算你们赢！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '绕后偷袭·摸到赵无极后背！！', icon: '👻', rarity: 'SSS', weight: 10, levelBoost: 4, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '六人配合·缠斗十分钟',         icon: '🤼', rarity: 'SS',  weight: 18, levelBoost: 2 },
+        { label: '被一拳打飞·但爬起来继续',     icon: '💥', rarity: 'A',   weight: 28, levelBoost: 1 },
+        { label: '差距太大·全程被碾压',         icon: '😖', rarity: 'B',   weight: 24 },
+        { label: '被赵无极点名批评·太弱了',     icon: '😔', rarity: 'C',   weight: 10 },
+        { label: '唐三指挥·六人完美配合',       icon: '🧠', rarity: 'SSS', weight: 10, levelBoost: 3, worldImpact: { tangSan: { affinity: 20 } } },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 250)
+    },
+  },
+  {
+    id: 'shrek_meal', title: '🌭 奥斯卡的恢复香肠', icon: '🍖', minLevel: 33, maxLevel: 45, rarity: 'B',
+    prelude: '训练结束，奥斯卡凑了过来。"诸位！尝尝我新研制的恢复香肠！保证比上次好吃！"众人面面相觑。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '大口吃下·魂力瞬间恢复！',     icon: '😋', rarity: 'SS',  weight: 20, levelBoost: 2, worldImpact: { oscar: { met: true, affinity: 10 } } },
+        { label: '半信半疑·尝了一口还行',       icon: '🤨', rarity: 'A',   weight: 30, worldImpact: { oscar: { met: true, affinity: 5 } } },
+        { label: '坚决不吃·上次的阴影还在',     icon: '🤢', rarity: 'B',   weight: 25 },
+        { label: '被小舞塞进嘴里·意外好吃',     icon: '😲', rarity: 'S',   weight: 15, levelBoost: 1, worldImpact: { oscar: { met: true, affinity: 5 }, xiaoWu: { affinity: 5 } } },
+        { label: '吃了一口吐了·奥斯卡伤心',     icon: '🤮', rarity: 'C',   weight: 10, worldImpact: { oscar: { met: true, affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'bone_fusion_1', title: '🦴 魂骨融合', icon: '💀', minLevel: 33, maxLevel: 50, rarity: 'SS',
+    prelude: '你获得了一块魂骨。融合魂骨是极其痛苦的过程——无数魂师因无法承受而被反噬。你准备好了吗？命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || state.level * 10
+      return [
+        { label: '完美融合·战力大增！！',   icon: '✨', rarity: 'SSS', weight: power >= 500 ? 18 : 5, levelBoost: 5, soulBone: { slot: 'rightArm', beast: '万年魂兽', colorName: '万年' } },
+        { label: '咬牙融合·获得魂骨技',     icon: '😤', rarity: 'SS',  weight: 22, levelBoost: 3 },
+        { label: '痛苦融合·但成功了',       icon: '😰', rarity: 'S',   weight: 28, levelBoost: 2 },
+        { label: '融合失败·魂骨碎裂',       icon: '💔', rarity: 'A',   weight: 25 },
+        { label: '不敢融合·先留着',         icon: '📦', rarity: 'B',   weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'bone_fusion_2', title: '⚡ 外附魂骨·八蛛矛', icon: '🕷️', minLevel: 42, maxLevel: 62, rarity: 'SSS',
+    requiredEvents: ['bone_fusion_1'],
+    prelude: '你在战斗中受了重伤，但脊椎处忽然传来剧痛——八根蛛矛从背后破体而出！这不是普通的魂骨，而是万年难遇的外附魂骨！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '掌控八蛛矛·觉醒外附魂骨！！', icon: '🕸️', rarity: 'SSS', weight: 8, levelBoost: 8, soulBone: { slot: 'external', beast: '人面魔蛛皇', colorName: '万年' } },
+        { label: '勉强控制·八蛛矛暴走',         icon: '😱', rarity: 'SS',  weight: 18, levelBoost: 4 },
+        { label: '唐三帮你压制·八蛛矛蛰伏',     icon: '🤝', rarity: 'S',   weight: 25, levelBoost: 3, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '剧痛昏厥·醒来后八蛛矛消失',   icon: '😵', rarity: 'A',   weight: 30 },
+        { label: '被八蛛矛反噬·生命垂危',       icon: '🩸', rarity: 'C',   weight: 19, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'shrekEntrance', title: '史莱克入学', icon: '📝', minLevel: 31, maxLevel: 42, rarity: 'A', enemyPower: 200,
+    prelude: '史莱克学院——只收怪物，不收普通人。赵无极老师站在门口："先过我这一关！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败赵无极·被院长看中！！', icon: '🌟', rarity: 'SSS', weight: 5, levelBoost: 5 },
+        { label: '顺利通过·正式入学',         icon: '✅', rarity: 'A',  weight: 30, levelBoost: 2 },
+        { label: '勉强通过·被列入观察名单',   icon: '😰', rarity: 'B',  weight: 28 },
+        { label: '被破格录取·潜力受认可',     icon: '🎫', rarity: 'S',  weight: 12, levelBoost: 1 },
+        { label: '惜败·但赵无极说了句"明年再来"', icon: '👋', rarity: 'C', weight: 15 },
+        { label: '惨败·被拒之门外',           icon: '🚫', rarity: 'C',  weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 200)
+    },
+  },
+  {
+    id: 'shrekEighth', title: '⚡ 第八怪？', icon: '👥', minLevel: 33, maxLevel: 55, rarity: 'SSS',
+    requiredEvents: ['shrekEntrance'],
+    prelude: '史莱克七怪正在选拔新成员。你会成为第八怪吗？命运之轮，请转动——',
+    computeOptions(state) {
+      const onShrekPath = state.unlockedEvents?.includes?.('shrekPath') || state.eventHistory?.includes?.('graduation')
+      return [
+        { label: '成为史莱克第八怪！', icon: '🌟', rarity: 'SSS', weight: 10, levelBoost: 5,
+          worldImpact: { tangSan: { affinity: 20, met: true }, daiMuBai: { met: true }, oscar: { met: true } }, unlocks: ['shrekPath'] },
+        { label: '备选成员·还需努力', icon: '🔄', rarity: 'A', weight: 25 },
+        { label: '因故错过选拔', icon: '😔', rarity: 'B', weight: 30 },
+        { label: '主动放弃·独自修炼', icon: '🚶', rarity: 'A', weight: 20 },
+      ]
+    },
+  },
+  // ⚡ 杀戮之都
+  {
+    id: 'slaughterCity', title: '⚡ 杀戮之都', icon: '🏚️', minLevel: 40, maxLevel: 55, rarity: 'SSS',
+    requiredEvents: ['enterForest'],
+    prelude: '"年轻人，你渴望力量吗？杀戮之都……十个进去，九个出不来。"命运之轮，请转动——',
+    resultTemplate: '{label}！{suffix}',
+    suffixes: {
+      SSS: '你在地狱路中觉醒了杀神领域！这是百万中无一的成就！',
+      SS: '你走过了地狱路！虽然没有觉醒领域，但你的实力已经脱胎换骨！',
+      S: '你在杀戮之都中存活了下来！',
+      A: '坚持许久·活着出来就是胜利。',
+      B: '太过危险，选择了在外围历练。',
+      C: '你听到了很多关于杀戮之都的传说。也许有一天，你会做好准备。',
+    },
+    computeOptions(state) {
+      const isTough = (parseInt((state.attributes?.innatePower || '').match(/[0-9]+/)?.[0]) || 0) >= 7 || state.attributes?.soulQualityRarity === 'SSS'
+      return [
+        { label: '走过地狱路·觉醒杀神领域！！', icon: '⚔️', rarity: 'SSS', weight: isTough ? 6 : 2, levelBoost: 10,
+          worldImpact: { slaughterCity: { survived: true, domain: 'killingGod' } } },
+        { label: '走过地狱路·实力脱胎换骨', icon: '💀', rarity: 'SS', weight: 10, levelBoost: 6 },
+        { label: '在杀戮之都存活', icon: '🩸', rarity: 'S', weight: 22, levelBoost: 4 },
+        { label: '坚持许久·活着出来', icon: '🚪', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '太过危险·外围历练', icon: '⚠️', rarity: 'B', weight: 22 },
+        { label: '未被允许进入', icon: '🚫', rarity: 'C', weight: 16 },
+      ]
+    },
+  },
+
+  // ==================== Lv.51-70: 大陆风云+海神岛 ====================
+  {
+    id: 'blueSilver_domain', title: '🌿 蓝银领域', icon: '🌐', minLevel: 50, maxLevel: 70, rarity: 'SSS',
+    requiredEvents: ['blueSilver_awaken'],
+    prelude: '唐三的蓝银草忽然与你产生了共鸣——大地之下，无数蓝银草在向你低语。"感受到了吗？这是蓝银领域——森林之王的权能。"命运之轮，请转动——',
+    computeOptions(state) {
+      const affinity = state.relationships?.tangSan?.affinity || 0
+      return [
+        { label: '觉醒蓝银领域·草木皆兵！！',     icon: '🌿', rarity: 'SSS', weight: affinity >= 30 ? 15 : 5, levelBoost: 8, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '初步感知·与蓝银草建立联系',     icon: '🌱', rarity: 'SS',  weight: 22, levelBoost: 4, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '共鸣失败·但蓝银草没有排斥你',   icon: '🍃', rarity: 'S',   weight: 30, levelBoost: 2 },
+        { label: '无法理解·唐三说时机未到',       icon: '⏳', rarity: 'A',   weight: 25, worldImpact: { tangSan: { affinity: 5 } } },
+        { label: '被蓝银草反噬·唐三出手相救',     icon: '🆘', rarity: 'C',   weight: 18, worldImpact: { tangSan: { affinity: 10 } } },
+      ]
+    },
+  },
+  {
+    id: 'blueSilver_emperor', title: '👑 蓝银皇血脉', icon: '💎', minLevel: 55, maxLevel: 75, rarity: 'SSS',
+    requiredEvents: ['blueSilver_domain'],
+    prelude: '星斗大森林最深处，唐三跪在一株巨大的蓝银皇前。"这是我的母亲——十万年蓝银皇化形。她的血脉，也可以传承给你。"命运之轮，请转动——',
+    computeOptions(state) {
+      const affinity = state.relationships?.tangSan?.affinity || 0
+      return [
+        { label: '继承蓝银皇血脉·皇者降临！！',   icon: '👑', rarity: 'SSS', weight: affinity >= 50 ? 15 : 5, levelBoost: 10, worldImpact: { tangSan: { affinity: 50 } } },
+        { label: '获得蓝银皇祝福·血脉觉醒',       icon: '💚', rarity: 'SS',  weight: 20, levelBoost: 6, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '血脉共鸣·但未完全觉醒',         icon: '🔄', rarity: 'S',   weight: 28, levelBoost: 3 },
+        { label: '唐三尊重你的选择·不强行传承',   icon: '🤝', rarity: 'A',   weight: 22, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '血脉排斥·无法承受皇者之威',     icon: '😰', rarity: 'C',   weight: 15, worldImpact: { tangSan: { affinity: -5 } } },
+      ]
+    },
+  },
+  {
+    id: 'past_masterBibi', title: '📖 大师与女教皇', icon: '💔', minLevel: 50, maxLevel: 72, rarity: 'SS',
+    prelude: '大师独自坐在月光下，手中握着一枚褪色的徽章。"你知道比比东年轻时长什么样吗？她曾经……"他的声音哽咽了。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '静静倾听·了解那段往事',       icon: '👂', rarity: 'SSS', weight: 25, levelBoost: 3, worldImpact: { yuXiaoGang: { affinity: 30 } } },
+        { label: '追问真相·大师终于说出实情',   icon: '❓', rarity: 'SS',  weight: 20, levelBoost: 4, worldImpact: { yuXiaoGang: { affinity: 20 }, biBiDong: { met: true, affinity: 5 } } },
+        { label: '劝大师放下·往前看',           icon: '🕊️', rarity: 'S',   weight: 28, levelBoost: 2, worldImpact: { yuXiaoGang: { affinity: 15 } } },
+        { label: '觉得不关你的事',               icon: '🤷', rarity: 'B',   weight: 18 },
+        { label: '去告诉比比东·大师还在想她',   icon: '💌', rarity: 'C',   weight: 9, levelBoost: 1, worldImpact: { biBiDong: { affinity: 10 }, yuXiaoGang: { affinity: -30 } } },
+      ]
+    },
+  },
+  {
+    id: 'past_rakasha', title: '👿 罗刹神的低语', icon: '🕯️', minLevel: 65, maxLevel: 85, rarity: 'SSS',
+    prelude: '武魂殿最深处，比比东独自坐在教皇宝座上。她的双眼时而清明，时而漆黑——罗刹神正在侵蚀她的灵魂。"不……我不能……"命运之轮，请转动——',
+    computeOptions(state) {
+      const isEnemy = state.relationships?.biBiDong?.faction === 'enemy'
+      return [
+        { label: '试图唤醒比比东的人性',     icon: '🕊️', rarity: 'SSS', weight: isEnemy ? 5 : 12, levelBoost: 5, worldImpact: { biBiDong: { affinity: 30 } } },
+        { label: '冷眼旁观·这是她的因果',   icon: '👀', rarity: 'SS',  weight: 22, levelBoost: 3 },
+        { label: '趁机获取罗刹神的力量',     icon: '⚡', rarity: 'S',   weight: 15, levelBoost: 4, worldImpact: { biBiDong: { affinity: -40 } } },
+        { label: '被比比东发现·差点被杀',   icon: '😰', rarity: 'A',   weight: 28, levelBoost: 1, worldImpact: { biBiDong: { affinity: -10 } } },
+        { label: '罗刹神注意到了你',         icon: '👁️', rarity: 'C',   weight: 23, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'huntStarted', title: '⚡ 猎魂行动', icon: '⚠️', minLevel: 42, maxLevel: 80, rarity: 'SSS', exclusiveGroup: 'warStance', enemyPower: 6000,
+    prelude: '武魂殿发动了猎魂行动！整个大陆陷入动荡……你的立场是？命运之轮，请转动——',
+    computeOptions(state) {
+      const against = state.relationships?.biBiDong?.faction === 'hostile'
+      const tangFriend = isAlliedWith('tangSan')(state)
+      const base = [
+        { label: '挺身而出·对抗武魂殿', icon: '🛡️', rarity: 'SSS', weight: against ? 30 : (tangFriend ? 15 : 6), levelBoost: 5,
+          worldImpact: { biBiDong: { affinity: -50, faction: 'enemy' }, tangSan: { affinity: 30 } } },
+        { label: '暗中帮助受害者', icon: '🕵️', rarity: 'S', weight: 20, levelBoost: 3,
+          worldImpact: { biBiDong: { affinity: -15 } } },
+        { label: '保持中立·明哲保身', icon: '⚖️', rarity: 'A', weight: 28 },
+        { label: '加入武魂殿阵营', icon: '⛪', rarity: 'B', weight: 20, levelBoost: 2,
+          worldImpact: { biBiDong: { affinity: 30, faction: 'friend' }, tangSan: { affinity: -40 } } },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 6000)
+    },
+  },
+  // ⚡ 唐门暗器 — 需要唐三友谊
+  {
+    id: 'tangSectWeapons', title: '⚡ 唐门暗器', icon: '🏹', minLevel: 52, maxLevel: 68, rarity: 'SSS',
+    requiredEvents: ['huntStarted'],
+    prelude: '唐三从怀中取出一卷泛黄的图纸："这是我唐门的暗器图谱。如果你愿意，我可以教你。"命运之轮，请转动——',
+    computeOptions(state) {
+      const tangFriend = isAlliedWith('tangSan')(state)
+      if (!tangFriend) {
+        return [{ label: '你还没有得到唐三的信任', icon: '❓', rarity: 'C', weight: 100 }]
+      }
+      const closeBond = (state.relationships?.tangSan?.affinity || 0) >= 20
+      return [
+        { label: '获得整套唐门暗器图谱！！', icon: '📜', rarity: 'SSS', weight: closeBond ? 12 : 4, levelBoost: 5,
+          worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '学会制作诸葛神弩', icon: '🏹', rarity: 'SS', weight: closeBond ? 25 : 12, levelBoost: 3 },
+        { label: '几种实用机括暗器', icon: '🔫', rarity: 'S', weight: 28, levelBoost: 2,
+          worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '不感兴趣·但也长了见识', icon: '🤷', rarity: 'B', weight: 18 },
+      ]
+    },
+  },
+  // 海神相关事件
+  {
+    id: 'seaVoyage', title: '渡海征途', icon: '⛵', minLevel: 55, maxLevel: 72, rarity: 'SS',
+    prelude: '茫茫大海之上，传说中的海神岛就在前方。命运之轮，请转动——',
+    computeOptions(state) {
+      const seaBlood = state.attributes?.race === '海魂师后裔'
+      return [
+        { label: '乘风破浪·领悟海洋', icon: '🌊', rarity: 'SSS', weight: seaBlood ? 8 : 2, levelBoost: 5 },
+        { label: '激战深海魔鲸', icon: '🐋', rarity: 'SS', weight: 8, levelBoost: 3,
+          soulRing: { year: 100000, colorName: '十万年', colorHex: '#FF1744', beast: '深海魔鲸', skill: '深海之怒' } },
+        { label: '遭遇风暴·勉强抵达', icon: '🌪️', rarity: 'A', weight: 30 },
+        { label: '九死一生·漂流数日', icon: '🛟', rarity: 'B', weight: 25 },
+        { label: '迷失大海·最终靠岸', icon: '🧭', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'seaGodTrial', title: '⚡ 海神九考', icon: '🔱', minLevel: 58, maxLevel: 78, rarity: 'SSS',
+    requiredEvents: ['seaVoyage'],
+    prelude: '海神雕像前，苍老的声音响起："欲承海神之位，须过九考。"命运之轮，请转动——',
+    computeOptions(state) {
+      const highInnate = (parseInt((state.attributes?.innatePower || '').match(/[0-9]+/)?.[0]) || 0) >= 8
+      return [
+        { label: '海神九考·完美契合', icon: '🔱', rarity: 'SSS', weight: highInnate ? 12 : 4, levelBoost: 10,
+          worldImpact: { seaGodInherited: true } },
+        { label: '海神七考·极高潜力', icon: '⭐', rarity: 'SS', weight: 18, levelBoost: 6 },
+        { label: '海神五考·优秀资质', icon: '📋', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '黑级考核·仍需努力', icon: '⚫', rarity: 'B', weight: 20 },
+        { label: '未获考核资格', icon: '🚫', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+
+  // ==================== Lv.71-90: 武魂帝国+封号 ====================
+  {
+    id: 'grandBattle', title: '⚡ 嘉陵关大战', icon: '⚔️', minLevel: 71, maxLevel: 82, rarity: 'SS', isMilestone: true,
+    enemyPower: 18000,
+    prelude: '武魂帝国大军压境至嘉陵关！敌方大将的实力深不可测——你暗中评估着双方的实力差距……命运之轮，请转动——',
+    computeOptions(state) {
+      const isHero = state.relationships?.biBiDong?.faction === 'enemy'
+      const base = [
+        { label: '斩将！大获全胜', icon: '🗡️', rarity: 'SSS', weight: isHero ? 8 : 3, levelBoost: 6 },
+        { label: '战术奇袭·以少胜多', icon: '🧠', rarity: 'SS', weight: 18, levelBoost: 4 },
+        { label: '惨烈守关·守住阵地', icon: '🩸', rarity: 'S', weight: 25, levelBoost: 2 },
+        { label: '战败·撤退', icon: '🏃', rarity: 'B', weight: 20 },
+        { label: '惨败·但集结残兵', icon: '🪖', rarity: 'C', weight: 14 },
+        { label: '被俘入狱', icon: '🔗', rarity: 'C', weight: 10 },
+        { label: '奇迹逆转·绝境反杀', icon: '⚡', rarity: 'SSS', weight: 2, levelBoost: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 2500)
+    },
+  },
+  {
+    id: 'fourClans', title: '⚡ 四大宗族', icon: '🏴', minLevel: 73, maxLevel: 87, rarity: 'SSS',
+    prelude: '四大宗族——力/御/敏/破——正在庚辛城选择站队。命运之轮，请转动——',
+    computeOptions(state) {
+      const isHero = state.relationships?.biBiDong?.faction === 'enemy'
+      return [
+        { label: '拉拢全部四大宗族！！', icon: '🏴', rarity: 'SSS', weight: isHero ? 12 : 4, levelBoost: 8,
+          worldImpact: { fourClans: { allied: true } } },
+        { label: '拉拢力之一族与敏之一族', icon: '💪', rarity: 'SS', weight: isHero ? 20 : 10, levelBoost: 5 },
+        { label: '杨无敌的破之一族加盟', icon: '🗡️', rarity: 'S', weight: 22, levelBoost: 3 },
+        { label: '友好关系·部分合作', icon: '🤝', rarity: 'A', weight: 28 },
+        { label: '谈判未成·留下好印象', icon: '📋', rarity: 'B', weight: 18 },
+      ]
+    },
+  },
+  {
+    id: 'titleDouluo', title: '封号加冕', icon: '👑', minLevel: 85, maxLevel: 95, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['douluoTower'],
+    prelude: '九环齐鸣！你终于踏入了封号斗罗的行列！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '龙皇斗罗', icon: '🐉', rarity: 'SSS', weight: 5 },
+        { label: '烈焰斗罗', icon: '🔥', rarity: 'SS', weight: 12 },
+        { label: '苍穹斗罗', icon: '☁️', rarity: 'SS', weight: 12 },
+        { label: '寒冰斗罗', icon: '❄️', rarity: 'S', weight: 15 },
+        { label: '不朽斗罗', icon: '💎', rarity: 'S', weight: 15 },
+        { label: '疾风斗罗', icon: '💨', rarity: 'A', weight: 22 },
+        { label: '铁壁斗罗', icon: '🛡️', rarity: 'B', weight: 12 },
+        { label: '无名斗罗', icon: '❓', rarity: 'C', weight: 4 },
+      ]
+    },
+  },
+
+  // ==================== Lv.91-100: 神位之争 ====================
+  {
+    id: 'godTrial', title: '⚡ 神位考验', icon: '🔱', minLevel: 85, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '神界的大门已经为你打开。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '自创神位·独一无二', icon: '💫', rarity: 'SSS', weight: 6, levelBoost: 10 },
+        { label: '海神九考·完美通过', icon: '🌊', rarity: 'SSS', weight: 8, levelBoost: 8 },
+        { label: '修罗神考验·通过',   icon: '⚔️', rarity: 'SSS', weight: 8, levelBoost: 8 },
+        { label: '天使神·九考通过',   icon: '👼', rarity: 'SS',  weight: 15, levelBoost: 5 },
+        { label: '一级神祇认可',       icon: '⭐', rarity: 'S',   weight: 30, levelBoost: 3 },
+        { label: '未通过·继续努力',   icon: '🔄', rarity: 'C',   weight: 13 },
+      ]
+    },
+  },
+  // ==================== 原著深度事件 Lv.21-40 ====================
+  {
+    id: 'canon_tangSanGift', title: '📖 二十四桥明月夜', icon: '🎁', minLevel: 25, maxLevel: 40, rarity: 'SS',
+    requiredEvents: ['firstEncounter'],
+    prelude: '唐三从怀中取出一条精致的腰带——二十四桥明月夜。"这是我自己做的储物魂导器。有二十四个独立空间。送给你。"命运之轮，请转动——',
+    computeOptions(state) {
+      const tangFriend = isAlliedWith('tangSan')(state)
+      if (!tangFriend && !hasMet('tangSan')(state)) return [{ label: '你与唐三尚未相熟', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '欣然接受·友谊加深', icon: '🤝', rarity: 'SSS', weight: tangFriend ? 25 : 10, levelBoost: 3, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '婉拒·但唐三坚持相赠', icon: '🎀', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '回赠自己制作的物品', icon: '🔄', rarity: 'SS', weight: 20, levelBoost: 3, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '收下但不以为意', icon: '😐', rarity: 'B', weight: 20, levelBoost: 1 },
+        { label: '怀疑有诈·拒绝', icon: '🤨', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'canon_xiaoWuSanctuary', title: '📖 柔骨兔圣地', icon: '🐰', minLevel: 28, maxLevel: 42, rarity: 'SS',
+    requiredEvents: ['xiaoWuEncounter'],
+    prelude: '小舞悄悄地带你来到了星斗大森林深处——柔骨兔一族的圣地。这里埋葬着她的族人，也隐藏着一个关于十万年魂兽化形的秘密。命运之轮，请转动——',
+    computeOptions(state) {
+      const xiaoFriend = isAlliedWith('xiaoWu')(state)
+      if (!xiaoFriend) return [{ label: '你还未得到小舞的信任', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '倾听秘密·许下守护之誓', icon: '🤞', rarity: 'SSS', weight: 20, levelBoost: 5, worldImpact: { xiaoWu: { affinity: 40, faction: 'friend' } } },
+        { label: '尊重她的秘密·不追问',   icon: '🤫', rarity: 'SS', weight: 25, levelBoost: 3, worldImpact: { xiaoWu: { affinity: 20 } } },
+        { label: '获得柔骨兔一族的祝福',  icon: '🙏', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '圣地突然被魂兽攻击',    icon: '⚠️', rarity: 'A', weight: 17, levelBoost: 2 },
+        { label: '无法进入·被结界阻挡',  icon: '🚧', rarity: 'B', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'canon_masterTheory', title: '📖 大师的魂环理论', icon: '📖', minLevel: 22, maxLevel: 38, rarity: 'S',
+    requiredEvents: ['firstEncounter'],
+    prelude: '玉小刚——大师——找到了你。他的眼中闪烁着智慧的光芒："我研究出了一套魂环配置的最优理论。如果你愿意，可以成为第一个实践者。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接受指导·成为大师的弟子', icon: '🎓', rarity: 'SSS', weight: 15, levelBoost: 4, worldImpact: { yuXiaoGang: { met: true, affinity: 30 } } },
+        { label: '参考理论·独立实践',       icon: '📝', rarity: 'SS', weight: 25, levelBoost: 3 },
+        { label: '质疑理论·提出自己的见解', icon: '💬', rarity: 'S', weight: 22, levelBoost: 3, worldImpact: { yuXiaoGang: { met: true, affinity: 15 } } },
+        { label: '婉拒·自己摸索',           icon: '🙅', rarity: 'B', weight: 25, levelBoost: 1 },
+        { label: '理论太难·听不懂',         icon: '😵', rarity: 'C', weight: 13 },
+      ]
+    },
+  },
+
+  // ==================== 原著深度事件 Lv.41-60 ====================
+  {
+    id: 'canon_daiMuBai', title: '📖 星罗边境', icon: '🦁', minLevel: 42, maxLevel: 58, rarity: 'SS',
+    prelude: '戴沐白邀请你前往星罗帝国边境执行一项秘密任务。他的皇兄戴维斯似乎在暗中勾结武魂殿——一场皇位之争即将爆发。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '并肩作战·揭露阴谋',   icon: '🤝', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { daiMuBai: { met: true, affinity: 30, faction: 'friend' } } },
+        { label: '暗中调查·智取证据',   icon: '🕵️', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '通知武魂殿·换取赏金', icon: '💰', rarity: 'C', weight: 15, worldImpact: { daiMuBai: { affinity: -40 }, biBiDong: { affinity: 10 } } },
+        { label: '发现戴维斯的秘密部队', icon: '👀', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '被卷入战斗·被迫参战', icon: '⚔️', rarity: 'A', weight: 23, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'canon_duguBoPill', title: '📖 独孤博的本命毒丹', icon: '☠️', minLevel: 38, maxLevel: 55, rarity: 'SSS',
+    requiredEvents: ['iceFireWell'],
+    prelude: '独孤博神色凝重地找到你："小子，老夫的本命毒丹出现了裂痕。若不修复，三个月内老夫必死。而你——是唯一能进入冰火两仪眼帮我取药的人。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '冒死取药·独孤博欠你一命！！', icon: '💊', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { duGuBo: { affinity: 80, faction: 'friend' } } },
+        { label: '成功取药·但自己也中了毒',     icon: '🤢', rarity: 'SS', weight: 20, levelBoost: 5, worldImpact: { duGuBo: { affinity: 40 } } },
+        { label: '请唐三帮忙一起取药',           icon: '🤝', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '取药失败·毒丹彻底碎裂',       icon: '💔', rarity: 'A', weight: 20, levelBoost: 2 },
+        { label: '拒绝·不想冒险',               icon: '🙅', rarity: 'B', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'canon_huLiena', title: '📖 杀戮之都·胡列娜', icon: '🦊', minLevel: 43, maxLevel: 58, rarity: 'SS',
+    requiredEvents: ['slaughterCity'],
+    prelude: '在杀戮之都中，你遇到了武魂殿圣女——胡列娜。她也在进行地狱路的试炼。在这疯狂的地方，敌人和同伴的界限变得模糊……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '携手闯关·获得她的信任', icon: '🤝', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { huLiena: { met: true, affinity: 30 } } },
+        { label: '利用她探路·保存自己',   icon: '🕶️', rarity: 'A', weight: 22, levelBoost: 3, worldImpact: { huLiena: { met: true, affinity: -10 } } },
+        { label: '各走各路·互不干涉',     icon: '↔️', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '发现她的弱点·但没利用', icon: '👀', rarity: 'S', weight: 18, levelBoost: 4, worldImpact: { huLiena: { met: true, affinity: 10 } } },
+        { label: '陷害她·自己先过关',    icon: '🐍', rarity: 'C', weight: 18, levelBoost: 2, worldImpact: { huLiena: { met: true, affinity: -40 } } },
+      ]
+    },
+  },
+  {
+    id: 'canon_ningRongRong', title: '📖 九宝琉璃塔共鸣', icon: '💎', minLevel: 44, maxLevel: 60, rarity: 'SS',
+    prelude: '宁荣荣的九宝琉璃塔突然与你的武魂产生了共鸣！两股力量在空气中交织，形成了一个前所未有的魂力漩涡。七宝琉璃宗的护法们都被惊动了——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完成共鸣·武魂获得增幅！！', icon: '✨', rarity: 'SSS', weight: 10, levelBoost: 6, worldImpact: { ningRongRong: { met: true, affinity: 25 } } },
+        { label: '稳定共鸣·双方受益',         icon: '⚖️', rarity: 'SS', weight: 25, levelBoost: 4, worldImpact: { ningRongRong: { met: true, affinity: 15 } } },
+        { label: '被护法打断·但留下联系',     icon: '🛑', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '共鸣失败·但学到了东西',     icon: '📖', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '共鸣引发爆炸·双方受伤',     icon: '💥', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+
+  // ==================== 原著深度事件 Lv.61-80 ====================
+  {
+    id: 'canon_maHongJun', title: '📖 邪火凤凰·马红俊', icon: '🔥', minLevel: 62, maxLevel: 78, rarity: 'S',
+    prelude: '马红俊的邪火凤凰武魂突然失控了！他的体内邪火正在反噬——如果不及时压制，他可能会被自己的武魂烧成灰烬。你是唯一在场的人。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '冒险压制邪火·救下马红俊！！', icon: '🧯', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { maHongJun: { met: true, affinity: 40, faction: 'friend' } } },
+        { label: '用冰系力量镇压邪火',         icon: '❄️', rarity: 'SS', weight: 20, levelBoost: 4, worldImpact: { maHongJun: { met: true, affinity: 20 } } },
+        { label: '去找唐三帮忙·他一定有办法', icon: '🏃', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '束手无策·只能看着',           icon: '😰', rarity: 'B', weight: 20 },
+        { label: '邪火波及·自己也受伤',        icon: '🔥', rarity: 'C', weight: 20, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'canon_oscar', title: '📖 奥斯卡的食物武魂', icon: '🌭', minLevel: 64, maxLevel: 80, rarity: 'S',
+    prelude: '奥斯卡发明了一种新的食物系魂技——能临时提升魂师一个等级的战斗力！但材料极其稀缺，需要深入极北之地采集。"兄弟，能陪我去一趟吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '陪同采集·获得第一批成品！！', icon: '🍖', rarity: 'SSS', weight: 15, levelBoost: 5, worldImpact: { oscar: { met: true, affinity: 30 } } },
+        { label: '提供资金·让雇佣兵陪同',       icon: '💰', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '帮忙设计配方·优化效果',       icon: '🧪', rarity: 'SS', weight: 20, levelBoost: 4, worldImpact: { oscar: { met: true, affinity: 20 } } },
+        { label: '太危险·婉拒',                 icon: '🙅', rarity: 'B', weight: 22 },
+        { label: '采集失败·但也收获了其他药草', icon: '🌿', rarity: 'C', weight: 18, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'canon_zhuZhuQing', title: '📖 朱竹清的暗杀', icon: '🐱', minLevel: 66, maxLevel: 82, rarity: 'SS',
+    prelude: '朱竹清深夜找到了你——星罗帝国派来的刺客已经潜入营地。目标是她和戴沐白。她需要你帮忙设置一个反暗杀陷阱。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美设局·刺客全灭！！', icon: '🪤', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { zhuZhuQing: { met: true, affinity: 25 } } },
+        { label: '协助她击退刺客',        icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '活捉刺客·审问幕后',    icon: '🔗', rarity: 'S', weight: 28, levelBoost: 3, worldImpact: { zhuZhuQing: { met: true, affinity: 15 } } },
+        { label: '被刺客先发制人·陷入被动', icon: '😱', rarity: 'B', weight: 15, levelBoost: 1 },
+        { label: '袖手旁观·不关我事',    icon: '🤷', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+
+  // ==================== 原著深度事件 Lv.81-100 ====================
+  {
+    id: 'canon_tangHao', title: '📖 昊天斗罗·唐昊', icon: '🔨', minLevel: 82, maxLevel: 95, rarity: 'SSS',
+    prelude: '一个扛着巨大昊天锤的男人出现在你面前——昊天斗罗唐昊！唐三的父亲！"小子，听说你和我儿子有些交情。让老夫看看，你有没有资格做他的朋友。"命运之轮，请转动——',
+    computeOptions(state) {
+      const tangFriend = isAlliedWith('tangSan')(state)
+      return [
+        { label: '接下三锤·获得唐昊认可！！', icon: '💪', rarity: 'SSS', weight: tangFriend ? 15 : 5, levelBoost: 8, worldImpact: { tangHao: { met: true, affinity: 30 } } },
+        { label: '勉强接下·唐昊微微点头',     icon: '😤', rarity: 'SS', weight: 20, levelBoost: 5, worldImpact: { tangHao: { met: true, affinity: 10 } } },
+        { label: '以智取胜·不硬接',           icon: '🧠', rarity: 'S', weight: 25, levelBoost: 4, worldImpact: { tangHao: { met: true, affinity: 15 } } },
+        { label: '被震飞·但唐昊没下杀手',     icon: '💨', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '不敢应战·被鄙视',           icon: '😔', rarity: 'C', weight: 10, worldImpact: { tangHao: { met: true, affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'canon_biBiDong', title: '📖 教皇的试探', icon: '👸', minLevel: 84, maxLevel: 96, rarity: 'SSS',
+    prelude: '比比东女皇单独召见你。她的眼神深不可测，仿佛能将你的灵魂看穿。"你的潜力……让我想起了年轻时的自己。告诉我，你真正想要的是什么？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '坦诚回答·获得教皇赏识', icon: '🤝', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { biBiDong: { affinity: 30 } } },
+        { label: '含糊其辞·保持神秘',     icon: '🤫', rarity: 'SS', weight: 25, levelBoost: 3 },
+        { label: '反问教皇·反客为主',     icon: '🎭', rarity: 'S', weight: 22, levelBoost: 4, worldImpact: { biBiDong: { affinity: 10 } } },
+        { label: '拒绝回答·以沉默对抗',   icon: '🪨', rarity: 'A', weight: 25, levelBoost: 2, worldImpact: { biBiDong: { affinity: -10 } } },
+        { label: '被比比东看穿·深感不安', icon: '😰', rarity: 'B', weight: 16 },
+      ]
+    },
+  },
+  {
+    id: 'canon_seaGodTrident', title: '📖 海神三叉戟', icon: '🔱', minLevel: 86, maxLevel: 98, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['seaGodTrial'],
+    prelude: '海神岛上，巨大的海神三叉戟从海底缓缓升起！这是海神的信物——只有通过九考的人才能拔出它。它将赋予持有者掌控海洋的力量！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '拔出三叉戟·海神之力加身！！', icon: '🔱', rarity: 'SSS', weight: 8, levelBoost: 10, worldImpact: { seaGodTrident: true } },
+        { label: '三叉戟共鸣·获得部分力量',   icon: '💙', rarity: 'SS', weight: 20, levelBoost: 6 },
+        { label: '无法拔出·但戟身赐予祝福',   icon: '🙏', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '三叉戟太重·举不动',         icon: '💪', rarity: 'A', weight: 22, levelBoost: 2 },
+        { label: '被戟身反弹·受了内伤',       icon: '⚡', rarity: 'B', weight: 20, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'canon_asuraGod', title: '📖 修罗神的试炼', icon: '⚔️', minLevel: 88, maxLevel: 99, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['slaughterCity'],
+    prelude: '修罗神——执掌杀戮与审判的神祇——亲自降临在你面前。他的双眼如同深渊："想要成为修罗神？先通过我的死亡试炼。败了，就是魂飞魄散。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '通过试炼·修罗神认可！！', icon: '💀', rarity: 'SSS', weight: 6, levelBoost: 12, worldImpact: { asuraGod: { passed: true } } },
+        { label: '九死一生·勉强通过',       icon: '🩸', rarity: 'SS', weight: 15, levelBoost: 8 },
+        { label: '中途放弃·但修罗神留手',   icon: '🛑', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '被击溃·但修罗神看到了潜力', icon: '💫', rarity: 'A', weight: 24, levelBoost: 3 },
+        { label: '直接拒绝·修罗神冷笑离去', icon: '😤', rarity: 'B', weight: 25, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'canon_shrekReunion', title: '📖 七怪重聚', icon: '👥', minLevel: 90, maxLevel: 100, rarity: 'SSS',
+    requiredEvents: ['shrekEighth'],
+    prelude: '大战前夕——史莱克七怪（加上你，八怪）终于再次聚首！唐三、小舞、戴沐白、奥斯卡、马红俊、宁荣荣、朱竹清——你们围坐在篝火旁，回忆着过往，展望着明天。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '七怪齐聚·羁绊永恒！！', icon: '🌟', rarity: 'SSS', weight: 20, levelBoost: 6, worldImpact: { tangSan: { affinity: 30 }, xiaoWu: { affinity: 20 }, daiMuBai: { affinity: 15 }, oscar: { affinity: 15 } } },
+        { label: '制定最终作战计划',       icon: '📋', rarity: 'SS', weight: 30, levelBoost: 4 },
+        { label: '分工明确·各司其职',     icon: '🤝', rarity: 'S', weight: 25, levelBoost: 3 },
+        { label: '有人缺席·心中遗憾',     icon: '😔', rarity: 'A', weight: 15, levelBoost: 2 },
+        { label: '产生了分歧·不欢而散',   icon: '💢', rarity: 'B', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'sectMission', title: '宗门秘境', icon: '🏯', minLevel: 33, maxLevel: 48, rarity: 'S',
+    prelude: '学院安排了一次宗门秘境探险。据说秘境深处藏着一件上古遗物——但也伴随着致命的机关。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '闯入深处·获得上古遗物！！', icon: '🏺', rarity: 'SSS', weight: 4, levelBoost: 6, soulBone: { slot: 'torso', beast: '上古遗物融合', year: 80000, skill: '上古守护', rarity: 'SS' } },
+        { label: '智破机关·获得传承',       icon: '🧠', rarity: 'SS', weight: 15, levelBoost: 4 },
+        { label: '组队协作·各有所获',       icon: '🤝', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '被机关困住·勉强脱身',     icon: '🪤', rarity: 'B', weight: 25 },
+        { label: '触发陷阱·受伤退出',       icon: '🤕', rarity: 'C', weight: 26 },
+      ]
+    },
+  },
+  {
+    id: 'selfCreatedSkill', title: '自创魂技', icon: '💡', minLevel: 35, maxLevel: 52, rarity: 'SS',
+    prelude: '你在修炼中突然灵光一现——一个前所未有的魂技构想出现在脑海中！如果能完善它，这将成为属于你自己的独门绝技！命运之轮，请转动——',
+    computeOptions(state) {
+      const highInnate = (parseInt((state.attributes?.innatePower || '').match(/[0-9]+/)?.[0]) || 0) >= 7
+      return [
+        { label: '完美创出·自创神技！！', icon: '✨', rarity: 'SSS', weight: highInnate ? 10 : 4, levelBoost: 8 },
+        { label: '创出实用魂技·战力提升', icon: '⚡', rarity: 'SS', weight: 20, levelBoost: 5 },
+        { label: '初步完成·还需打磨',     icon: '🔧', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '方向错了·推倒重来',     icon: '🔄', rarity: 'B', weight: 25 },
+        { label: '走火入魔·但意外突破',   icon: '🔥', rarity: 'S', weight: 21, levelBoost: 4 },
+      ]
+    },
+  },
+  {
+    id: 'sunsetForest', title: '落日森林', icon: '🌅', minLevel: 37, maxLevel: 54, rarity: 'A',
+    prelude: '落日森林——仅次于星斗大森林的第二大魂兽聚集地。据说这里隐藏着一种罕见的双属性魂兽。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '捕获双属性魂兽·极品魂环！！', icon: '🦅', rarity: 'SSS', weight: 3, levelBoost: 6, soulRing: { year: 60000, colorName: '五万年', colorHex: '#4A148C', beast: '双属性雷火鸟', skill: '雷火双翼' } },
+        { label: '发现隐藏洞穴·获得大量资源',   icon: '💎', rarity: 'SS', weight: 12, levelBoost: 4 },
+        { label: '遭遇魂兽群·激战突围',         icon: '⚔️', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '迷路三天·但也采到不少药草',   icon: '🌿', rarity: 'B', weight: 28 },
+        { label: '被高阶魂兽追赶·狼狈逃离',     icon: '🏃', rarity: 'C', weight: 27 },
+      ]
+    },
+  },
+  {
+    id: 'northLand', title: '极北之地', icon: '❄️', minLevel: 38, maxLevel: 56, rarity: 'S',
+    prelude: '极北之地的寒风如刀割般刺骨。在这片冰封的大地上，传说有一种冰系神兽的幼崽偶尔会出现——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '遇到冰系神兽幼崽·完美魂环！！', icon: '🧊', rarity: 'SSS', weight: 3, levelBoost: 7, soulRing: { year: 90000, colorName: '五万年', colorHex: '#4A148C', beast: '冰系神兽幼崽', skill: '绝对零度' } },
+        { label: '发现万年冰髓·魂力大增',         icon: '💠', rarity: 'SS', weight: 14, levelBoost: 5 },
+        { label: '在极寒中磨练意志·突破瓶颈',     icon: '💪', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '遭遇暴风雪·勉强幸存',           icon: '🌨️', rarity: 'B', weight: 30 },
+        { label: '冻伤严重·但活了下来',           icon: '🥶', rarity: 'C', weight: 25 },
+      ]
+    },
+  },
+  {
+    id: 'soulMutation', title: '武魂变异', icon: '🧬', minLevel: 34, maxLevel: 50, rarity: 'SS',
+    prelude: '你的武魂突然出现了异常的波动——它在变异！这可能让你变得更强，也可能带来未知的风险……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '良性变异·武魂品质提升！！', icon: '⬆️', rarity: 'SSS', weight: 5, levelBoost: 8 },
+        { label: '稳定控制变异方向',           icon: '🎛️', rarity: 'SS', weight: 18, levelBoost: 5 },
+        { label: '变异平缓·略有增强',         icon: '📈', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '勉强压制住变异',             icon: '🛑', rarity: 'A', weight: 27, levelBoost: 1 },
+        { label: '变异副作用·但学会适应',     icon: '🦾', rarity: 'B', weight: 20, levelBoost: 2 },
+      ]
+    },
+  },
+
+  // ==================== 剧情弧线1：大师的弟子（Lv.15-35） ====================
+  {
+    id: 'arc_master_1', title: '🔗 大师的入学测试', icon: '📝', minLevel: 15, maxLevel: 35, rarity: 'S',
+    prelude: '玉小刚——被称为"大师"的男人——决定亲自测试你的潜力。他的眼神中既有期待也有怀疑："让我看看，你是否有资格成为我的弟子。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美通过·大师眼睛一亮', icon: '✨', rarity: 'SSS', weight: 12, levelBoost: 3, unlocks: ['arc_master_2'], worldImpact: { yuXiaoGang: { met: true, affinity: 25 } } },
+        { label: '顺利通过·获得肯定',     icon: '✅', rarity: 'SS', weight: 28, levelBoost: 2, unlocks: ['arc_master_2'] },
+        { label: '勉强通过·大师微微皱眉', icon: '😰', rarity: 'A', weight: 30, levelBoost: 1, unlocks: ['arc_master_2'] },
+        { label: '被大师指出致命缺陷',     icon: '🔍', rarity: 'B', weight: 20 },
+        { label: '测试失败·但大师看到了潜力', icon: '💪', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'arc_master_2', title: '🔗 魂环理论实践', icon: '📖', minLevel: 20, maxLevel: 45, rarity: 'SS',
+    requiredEvents: ['arc_master_1'],
+    prelude: '大师拿出了他的魂环配置理论——"魂环不是越强越好，而是越适合越好。你的第一魂环如果是百年，未来可承载万年第九环；如果是千年，反而会限制上限。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完全理解·理论实践完美', icon: '🧠', rarity: 'SSS', weight: 15, levelBoost: 4, unlocks: ['arc_master_3'] },
+        { label: '理解大半·开始实践',     icon: '📊', rarity: 'SS', weight: 25, levelBoost: 3, unlocks: ['arc_master_3'] },
+        { label: '似懂非懂·但愿意尝试', icon: '🤔', rarity: 'A', weight: 30, levelBoost: 2, unlocks: ['arc_master_3'] },
+        { label: '质疑理论·引发辩论',   icon: '💬', rarity: 'S', weight: 20, levelBoost: 2 },
+        { label: '太难了·完全听不懂',   icon: '😵', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'arc_master_3', title: '🔗 大师的极限训练', icon: '🏋️', minLevel: 25, maxLevel: 50, rarity: 'SSS',
+    requiredEvents: ['arc_master_2'],
+    prelude: '大师带你和唐三来到了一片隐秘的训练场——这里是他年轻时用来极限训练的地方。\u201c从今天起的一个月，你们将经历地狱般的训练。能坚持下来的，才有资格冠以\u2018大师弟子\u2019之名。\u201d命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完成全部训练·实力飞跃', icon: '💪', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { yuXiaoGang: { affinity: 30 }, tangSan: { affinity: 15, met: true } } },
+        { label: '完成大半·体质大增',     icon: '🏃', rarity: 'SS', weight: 28, levelBoost: 4 },
+        { label: '中途受伤·但坚持到底',   icon: '🩹', rarity: 'S', weight: 25, levelBoost: 3 },
+        { label: '太痛苦·中途退出',       icon: '😩', rarity: 'B', weight: 20 },
+        { label: '第一天就放弃了',         icon: '🏳️', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+
+  // ==================== 剧情弧线2：精英赛之路（Lv.35-55） ====================
+  {
+    id: 'arc_tournament_1', title: '🔗 学院选拔赛', icon: '🏟️', minLevel: 35, maxLevel: 55, rarity: 'S', isMilestone: true,
+    prelude: '全大陆精英赛的学院内部选拔开始了。只有最强的七人才能代表学院出战。你站在选拔赛的擂台上——这是证明自己最好的机会。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '全胜通过·震惊全院',   icon: '🌟', rarity: 'SSS', weight: 12, levelBoost: 4, unlocks: ['arc_tournament_2'] },
+        { label: '顺利入选代表队',       icon: '✅', rarity: 'SS', weight: 28, levelBoost: 3, unlocks: ['arc_tournament_2'] },
+        { label: '惊险入选·最后一刻',   icon: '😰', rarity: 'A', weight: 30, levelBoost: 2, unlocks: ['arc_tournament_2'] },
+        { label: '落选·但被选为替补',   icon: '🔄', rarity: 'B', weight: 20 },
+        { label: '落选·遗憾离场',       icon: '😔', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'arc_tournament_2', title: '🔗 关键一战·天水学院', icon: '💧', minLevel: 40, maxLevel: 58, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_tournament_1'],
+    prelude: '精英赛关键一战——对手是天水学院！她们的武魂融合技"冰雪飘零"曾让无数强队饮恨。弗兰德院长面色凝重："这一战，必须赢！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美破解武魂融合技·大胜', icon: '❄️', rarity: 'SSS', weight: 12, levelBoost: 5, unlocks: ['arc_tournament_3'] },
+        { label: '激战后险胜·挺进下一轮',   icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 4, unlocks: ['arc_tournament_3'] },
+        { label: '团队配合制胜·战术立功',   icon: '🤝', rarity: 'S', weight: 28, levelBoost: 3, unlocks: ['arc_tournament_3'] },
+        { label: '因伤险败·但虽败犹荣',     icon: '🩹', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '惨败·被淘汰',             icon: '💔', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'arc_tournament_3', title: '🔗 冠军之夜', icon: '🏆', minLevel: 45, maxLevel: 70, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_tournament_2'],
+    prelude: '精英赛的决赛之夜！武魂城中央大斗魂场内座无虚席。教皇比比东亲临现场观战。你站在决赛的擂台上，脚下是整个大陆的目光——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '夺冠！！全场沸腾！！',   icon: '🥇', rarity: 'SSS', weight: 10, levelBoost: 10, worldImpact: { biBiDong: { met: true, affinity: 5 } } },
+        { label: '亚军·虽败犹荣',         icon: '🥈', rarity: 'SS', weight: 25, levelBoost: 7 },
+        { label: '季军·实力不俗',         icon: '🥉', rarity: 'S', weight: 30, levelBoost: 5 },
+        { label: '决赛中受伤退赛',         icon: '🤕', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '表现不佳·但积累了大赛经验', icon: '📈', rarity: 'B', weight: 15, levelBoost: 2 },
+      ]
+    },
+  },
+
+  // ==================== 天使九考 ====================
+  {
+    id: 'arc_angel_1', title: '👼 天使第一考·圣光洗礼', icon: '✨', minLevel: 45, maxLevel: 70, rarity: 'SS', isMilestone: true,
+    prelude: '天使神的圣光从天空降落——你被选中接受天使九考！第一考：接受圣光洗礼。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 1500)
+      return [
+        { label: '圣光完美洗礼·天使之力初现！！', icon: '👼', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 6 },
+        { label: '顺利通过·天使印记浮现',         icon: '✨', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 4 },
+        { label: '勉强承受·但通过了',             icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '失败·圣光消散',                 icon: '💨', rarity: 'C', weight: Math.max(5, 27 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_2', title: '👼 天使第二考·信仰之门', icon: '🚪', minLevel: 45, maxLevel: 72, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_angel_1'],
+    prelude: '第二考：推开信仰之门！只有心中充满光明信念的人才能通过。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 1500)
+      return [
+        { label: '信念坚定·门扉大开！！', icon: '🚪', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 5 },
+        { label: '成功推开·信仰之力加身', icon: '✨', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 4 },
+        { label: '勉强推开一道缝·通过了', icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '门纹丝不动',             icon: '🚫', rarity: 'C', weight: Math.max(5, 27 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_3', title: '👼 天使第三考·光翼初展', icon: '🪶', minLevel: 46, maxLevel: 74, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_angel_2'],
+    prelude: '第三考：展开天使光翼！从天使神殿的最高处跃下——在落地之前必须展开光翼。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 1800)
+      return [
+        { label: '光翼华丽展开·翱翔天际！！', icon: '🪶', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 6 },
+        { label: '成功展翼·平稳落地',         icon: '✅', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 4 },
+        { label: '差点摔落·最后一刻展开',     icon: '😱', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '失败·被天使接住',           icon: '👼', rarity: 'B', weight: Math.max(5, 33 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_4', title: '👼 天使第四考·审判之剑', icon: '⚔️', minLevel: 47, maxLevel: 76, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_angel_3'],
+    prelude: '第四考：击败天使神殿的审判官——一位天使神的忠实仆从！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败审判官·获得天使魂骨！！', icon: '⚔️', rarity: 'SSS', weight: 10, levelBoost: 7, soulBone: { slot: 'rightArm', beast: '天使审判官', year: 80000, skill: '审判之光', rarity: 'SS' } },
+        { label: '击败审判官·获得认可',         icon: '✅', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '打平·审判官认可你的勇气',     icon: '🤝', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '失败·但未放弃',               icon: '😔', rarity: 'C', weight: 38, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 4000)
+    },
+  },
+  {
+    id: 'arc_angel_5', title: '👼 天使第五考·圣歌洗礼', icon: '🎵', minLevel: 48, maxLevel: 78, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_angel_4'],
+    prelude: '第五考：聆听天使圣歌——在圣歌中找到内心的平静，否则会被圣歌所伤。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '与圣歌共鸣·天使亲和度大增！！', icon: '🎵', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 6 },
+        { label: '静静聆听·内心平和',             icon: '🧘', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 4 },
+        { label: '勉强承受·差点被圣歌所伤',       icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '无法承受·退出圣堂',             icon: '🏃', rarity: 'C', weight: Math.max(5, 27 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_6', title: '👼 天使第六考·圣焰淬炼', icon: '🔥', minLevel: 49, maxLevel: 82, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_angel_5'],
+    prelude: '第六考：走进天使圣焰！圣焰会烧尽一切杂质——只有纯正的灵魂才能通过。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 3000)
+      return [
+        { label: '圣焰淬炼·体质飞跃！！', icon: '🔥', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 8, soulRing: { slot: 6, year: 80000, colorName: '五万年', colorHex: '#4A148C', beast: '圣焰天使', skill: '圣焰焚天' } },
+        { label: '通过淬炼·体质大增',     icon: '💪', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 5 },
+        { label: '艰难通过·留下了灼伤',   icon: '🤕', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '无法承受·退出圣焰',     icon: '🏃', rarity: 'C', weight: Math.max(5, 33 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_7', title: '👼 天使第七考·圣域觉醒', icon: '🌐', minLevel: 50, maxLevel: 85, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_angel_6'],
+    prelude: '第七考：在天使圣域中觉醒自己的领域！天使神的光辉笼罩整个神殿。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 3500)
+      return [
+        { label: '领域觉醒·获得天使领域！！', icon: '🌐', rarity: 'SSS', weight: Math.floor(10 * pwr), levelBoost: 8, worldImpact: { domain: '天使领域' } },
+        { label: '领域初成·天使之力大增',     icon: '✨', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 5 },
+        { label: '勉强抵抗圣域·通过考验',     icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '被圣域逼退·失败',           icon: '😵', rarity: 'C', weight: Math.max(5, 35 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_8', title: '👼 天使第八考·六翼共鸣', icon: '🪽', minLevel: 51, maxLevel: 88, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_angel_7'],
+    prelude: '第八考：与六翼天使武魂产生共鸣！天使神虚影展开六翼——你必须让自己的武魂与之同频。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 4000)
+      return [
+        { label: '六翼共鸣·获得天使之翼！！', icon: '🪽', rarity: 'SSS', weight: Math.floor(8 * pwr), levelBoost: 10, soulBone: { slot: 'external', beast: '六翼天使', year: 100000, skill: '天使六翼', rarity: 'SSS' } },
+        { label: '共鸣成功·但羽翼未全',       icon: '✨', rarity: 'SS', weight: Math.floor(22 * pwr), levelBoost: 6 },
+        { label: '部分共鸣·获得祝福',         icon: '✅', rarity: 'S', weight: 28, levelBoost: 5 },
+        { label: '无法共鸣·天使神叹息',       icon: '😔', rarity: 'B', weight: Math.max(5, 42 - Math.floor(10 * pwr)), levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'arc_angel_9', title: '👼 天使第九考·天使降临', icon: '👼', minLevel: 62, maxLevel: 93, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_angel_8'],
+    prelude: '第九考——天使神本尊降临！"你已经通过了八考。现在，接受天使神的祝福——或者拒绝，选择自己的道路。"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '接受祝福·继承天使神位！！', icon: '👼', rarity: 'SSS', weight: 10, levelBoost: 12, worldImpact: { angelInherited: true } },
+        { label: '接受·但神位不完整',         icon: '⭐', rarity: 'SS', weight: 22, levelBoost: 8 },
+        { label: '获得天使印记·日后继承',     icon: '✨', rarity: 'S', weight: 28, levelBoost: 6 },
+        { label: '拒绝·选择自己的道路',       icon: '🚫', rarity: 'A', weight: 20, levelBoost: 5 },
+        { label: '失败·被天使神送回凡间',     icon: '⬇️', rarity: 'C', weight: 20, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 9000)
+    },
+  },
+  {
+    id: 'seagod_island', title: '🏝️ 白色沙滩', icon: '🏖️', minLevel: 58, maxLevel: 75, rarity: 'A',
+    prelude: '海神岛——被白色沙滩环绕的传说之岛。海浪轻拍岸礁，一个海魂师少女从浪花中走来："你也来参加海神考核吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '结识海魂师·了解海神岛规则', icon: '🤝', rarity: 'SS',  weight: 20, levelBoost: 3 },
+        { label: '独自探索·发现隐秘洞穴',     icon: '🔍', rarity: 'SSS', weight: 12, levelBoost: 4 },
+        { label: '被海魂兽袭击·勉强击退',     icon: '🐙', rarity: 'S',   weight: 25, levelBoost: 2 },
+        { label: '在沙滩修炼·魂力微涨',       icon: '🧘', rarity: 'A',   weight: 28, levelBoost: 1 },
+        { label: '迷路·差点掉进深海漩涡',     icon: '🌀', rarity: 'C',   weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'seagod_offering', title: '🌊 海神祭典', icon: '🎭', minLevel: 60, maxLevel: 80, rarity: 'SS',
+    prelude: '海神岛的居民聚集在巨大的海神雕像前。大祭司波塞西站在雕像顶端："献上你的祭品——证明你对海神的虔诚。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '献上万年魂骨·海神赐福！！', icon: '🦴', rarity: 'SSS', weight: 5, levelBoost: 8, worldImpact: { seaGodInherited: true } },
+        { label: '献上珍贵药草·获得海神祝福', icon: '🌿', rarity: 'SS',  weight: 15, levelBoost: 5 },
+        { label: '献上魂力·海神微微点头',     icon: '💙', rarity: 'S',   weight: 28, levelBoost: 3 },
+        { label: '没有什么可献·默默祈祷',     icon: '🙏', rarity: 'A',   weight: 30, levelBoost: 1 },
+        { label: '质疑祭典·被赶出神殿',       icon: '😤', rarity: 'C',   weight: 22 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_1', title: '🔗 海神的召唤', icon: '🌊', minLevel: 55, maxLevel: 75, rarity: 'SS', isMilestone: true,
+    prelude: '一个暴风雨的夜晚，你梦到了无边无际的大海。海面上，一位手持三叉戟的神祇注视着你。第二天醒来，你的手心上多了一个海神三叉戟的印记——这是海神的召唤。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '毅然前往·踏上征途',     icon: '⛵', rarity: 'SSS', weight: 20, levelBoost: 3, unlocks: ['arc_seagod_2'] },
+        { label: '做好准备再出发',         icon: '🎒', rarity: 'SS', weight: 28, levelBoost: 2, unlocks: ['arc_seagod_2'] },
+        { label: '犹豫再三·最终启程',     icon: '🤔', rarity: 'A', weight: 25, levelBoost: 1, unlocks: ['arc_seagod_2'] },
+        { label: '暂时忽略·时机未到',     icon: '⏸️', rarity: 'B', weight: 17 },
+        { label: '拒绝召唤·印记消失',     icon: '🚫', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_2', title: '🔗 海神亲和度', icon: '💙', minLevel: 56, maxLevel: 78, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_1'],
+    prelude: '海神岛上，一块巨大的水晶石矗立在神殿中央——这是测试海神亲和度的圣物。将手放在上面，水晶的光芒将揭示你与海神的契合程度。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '亲和度满级·金光冲天！！', icon: '✨', rarity: 'SSS', weight: 10, levelBoost: 6, unlocks: ['arc_seagod_3'] },
+        { label: '亲和度优秀·获得认可',     icon: '💙', rarity: 'SS', weight: 25, levelBoost: 4, unlocks: ['arc_seagod_3'] },
+        { label: '亲和度良好·可以修炼',     icon: '✅', rarity: 'S', weight: 30, levelBoost: 3, unlocks: ['arc_seagod_3'] },
+        { label: '亲和度一般·需要更多努力', icon: '🔄', rarity: 'A', weight: 20, levelBoost: 2 },
+        { label: '几乎没有亲和度',           icon: '😔', rarity: 'C', weight: 15, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_3', title: '🔗 海神之心', icon: '🔱', minLevel: 58, maxLevel: 82, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_2'],
+    prelude: '海神传承的最后一步——融合海神之心！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '完美融合·获得海神权能！！', icon: '🔱', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 8, worldImpact: { seaGodInherited: true } },
+        { label: '融合成功·海神之力加身',     icon: '✅', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 5 },
+        { label: '部分融合·需要更多时间',     icon: '⏳', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '融合失败·但武魂增强',       icon: '📈', rarity: 'B', weight: Math.max(5, 33 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_4', title: '🔗 海神第四考·潮汐之力', icon: '🌊', minLevel: 55, maxLevel: 80, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_seagod_3'],
+    prelude: '第四考：承受海潮冲击！站在礁石上迎接一百道巨浪的拍打而不倒下。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '巍然不动·完美通过！！', icon: '🧘', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 6 },
+        { label: '艰难通过·但收获巨大',   icon: '💪', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 4 },
+        { label: '被冲倒数次·最终成功',   icon: '🤕', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '失败·退回岸边',         icon: '⬅️', rarity: 'C', weight: Math.max(5, 30 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_5', title: '🔗 海神第五考·深海潜行', icon: '🤿', minLevel: 56, maxLevel: 82, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_seagod_4'],
+    prelude: '第五考：潜入万米深海！在海魂兽之间穿行而不被发现。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '驯服海魂兽·震惊海神岛！！', icon: '🐋', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 7, soulBone: { slot: 'leftLeg', beast: '深海魔鲸', year: 90000, skill: '深海之速', rarity: 'SS' } },
+        { label: '完美避过所有海魂兽',         icon: '🤿', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 5 },
+        { label: '被发现·但强行闯过',           icon: '⚔️', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '失败·浮出水面',               icon: '⬆️', rarity: 'C', weight: Math.max(5, 32 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_6', title: '🔗 海神第六考·海皇试炼', icon: '👑', minLevel: 60, maxLevel: 84, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_5'],
+    prelude: '第六考：击败海神岛守护者——魔魂大白鲨之王！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败鲨王·获得十万年魂环！！', icon: '🦈', rarity: 'SSS', weight: 8, levelBoost: 8, soulRing: { slot: 6, year: 100000, colorName: '十万年', colorHex: '#FF1744', beast: '魔魂大白鲨之王', skill: '魔鲨噬浪' } },
+        { label: '击败鲨王·获得认可',           icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '打平·鲨王让你通过',           icon: '🤝', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '失败·退回神殿',               icon: '😔', rarity: 'C', weight: 40, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3000)
+    },
+  },
+  {
+    id: 'arc_seagod_7', title: '🔗 海神第七考·领域觉醒', icon: '🌀', minLevel: 62, maxLevel: 86, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_6'],
+    prelude: '第七考：在海神领域的压迫下觉醒自己的领域之力！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 3000)
+      return [
+        { label: '领域觉醒·获得海神领域！！', icon: '🌀', rarity: 'SSS', weight: Math.floor(10 * pwr), levelBoost: 8, worldImpact: { domain: '海神领域' } },
+        { label: '成功抗压·领域初成',         icon: '💪', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 5 },
+        { label: '勉强通过·但领域未成形',     icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '晕了过去·被海浪冲回岸边',   icon: '😵', rarity: 'C', weight: Math.max(5, 35 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_8', title: '🔗 海神第八考·三叉戟试炼', icon: '🔱', minLevel: 64, maxLevel: 90, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_7'],
+    prelude: '第八考：拔出海底深渊中的海神三叉戟——重十万八千斤！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 4000)
+      return [
+        { label: '拔出三叉戟·海神之力加身！！', icon: '🔱', rarity: 'SSS', weight: Math.floor(8 * pwr), levelBoost: 10, worldImpact: { seaGodTrident: true } },
+        { label: '三叉戟动摇·但未拔出',         icon: '💪', rarity: 'SS', weight: Math.floor(22 * pwr), levelBoost: 6 },
+        { label: '获得三叉戟认可·但力量不够',   icon: '✅', rarity: 'S', weight: 28, levelBoost: 5 },
+        { label: '无法搬动分毫',                 icon: '😔', rarity: 'B', weight: Math.max(5, 42 - Math.floor(10 * pwr)), levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'arc_seagod_9', title: '🔗 海神第九考·登神', icon: '🌊', minLevel: 66, maxLevel: 95, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_seagod_8'],
+    prelude: '第九考——最终考验！海神本尊虚影降临——"证明你配得上海神之位。"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '通过试炼·继承海神之位！！', icon: '🌊', rarity: 'SSS', weight: 10, levelBoost: 12, worldImpact: { seaGodInherited: true }, unlocks: ['seaReturn'] },
+        { label: '通过·但神位不完整',         icon: '⭐', rarity: 'SS', weight: 22, levelBoost: 8 },
+        { label: '获得海神印记·日后继承',     icon: '🔱', rarity: 'S', weight: 28, levelBoost: 6 },
+        { label: '失败·被打回岸边',           icon: '😔', rarity: 'C', weight: 40, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 8000)
+    },
+  },
+  // ==================== 过渡事件：连接各等级段 ====================
+  {
+    id: 'bridge_notting', title: '🌉 诺丁城的日常', icon: '🏘️', minLevel: 10, maxLevel: 22, rarity: 'B',
+    prelude: '诺丁城的清晨，阳光洒在武魂殿分殿的尖顶上。学院里的钟声响起，新的一天开始了——平凡而充实的学院生活。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '在图书馆发现一本古籍', icon: '📚', rarity: 'SS', weight: 15, levelBoost: 2 },
+        { label: '帮助同学·获得好感',     icon: '🤝', rarity: 'A', weight: 25, levelBoost: 1 },
+        { label: '食堂遇到唐三和小舞',   icon: '🍜', rarity: 'S', weight: 20, levelBoost: 1, worldImpact: { tangSan: { met: true, affinity: 5 }, xiaoWu: { met: true, affinity: 5 } } },
+        { label: '普通的日常·按部就班', icon: '📋', rarity: 'B', weight: 25 },
+        { label: '偷懒被发现·被罚跑操场', icon: '🏃', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'bridge_toShrek', title: '🌉 前往史莱克', icon: '🚶', minLevel: 22, maxLevel: 38, rarity: 'A',
+    prelude: '离开诺丁学院后，你踏上了前往史莱克学院的道路。沿途的风景在变化，你的心境也在变化——从一个学院的学生，到即将面对一个全新世界的魂师。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '路遇劫匪·英雄救美',   icon: '🦸', rarity: 'SS', weight: 15, levelBoost: 3 },
+        { label: '与同行旅人结为好友',   icon: '🤝', rarity: 'S', weight: 25, levelBoost: 2 },
+        { label: '在途中突破一个小瓶颈', icon: '📈', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '平凡的旅途·安全抵达', icon: '🚶', rarity: 'B', weight: 22, levelBoost: 1 },
+        { label: '迷路了·绕了远路',     icon: '🧭', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'bridge_afterTournament', title: '🌉 大赛余波', icon: '🌊', minLevel: 45, maxLevel: 60, rarity: 'A',
+    requiredEvents: ['arc_tournament_1'],
+    prelude: '精英赛的喧嚣渐渐远去。你在武魂城中漫步，回想着这段时间的经历——战斗、友谊、荣耀……以及那些在比赛中结下的仇怨。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '被神秘势力暗中监视',   icon: '👁️', rarity: 'SS', weight: 15, levelBoost: 2, unlocks: ['huntStarted'] },
+        { label: '收到匿名挑战信',       icon: '✉️', rarity: 'S', weight: 22, levelBoost: 3 },
+        { label: '在武魂城采购稀有材料', icon: '🛒', rarity: 'A', weight: 28, levelBoost: 1 },
+        { label: '被粉丝围堵·签名到手软', icon: '✍️', rarity: 'B', weight: 20 },
+        { label: '卷入一场街头纠纷',     icon: '👊', rarity: 'C', weight: 15, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'bridge_beforeVoyage', title: '🌉 远航之前', icon: '⚓', minLevel: 58, maxLevel: 75, rarity: 'A',
+    prelude: '海风渐起。你站在天斗帝国的港口，望着远方若隐若现的海平线。去海神岛的船明天出发——今晚，是你在陆地上的最后一夜。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '与朋友们告别·收获祝福', icon: '👋', rarity: 'SS', weight: 20, levelBoost: 2, worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '采购航海物资·准备充分', icon: '🎒', rarity: 'A', weight: 28, levelBoost: 1 },
+        { label: '向老水手请教航海知识',   icon: '🧭', rarity: 'S', weight: 22, levelBoost: 2 },
+        { label: '在港口酒吧听到海神传说', icon: '🍺', rarity: 'B', weight: 20, levelBoost: 1 },
+        { label: '被小偷光顾·损失了一些钱财', icon: '😤', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'chain_shrek_1', title: '🔗 七怪试炼·集结', icon: '👥', minLevel: 30, maxLevel: 58, rarity: 'SS', isMilestone: true,
+    prelude: '弗兰德院长站在操场上宣布——史莱克七怪将进行一场特殊的团队试炼。而这一次，你也被邀请参加。"这将决定你们是否有资格代表学院参加全大陆精英赛。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美配合·团队评价SSS！！', icon: '🌟', rarity: 'SSS', weight: 12, levelBoost: 5, unlocks: ['chain_shrek_2'] },
+        { label: '顺利通过·获得团队认可',   icon: '✅', rarity: 'SS', weight: 28, levelBoost: 3, unlocks: ['chain_shrek_2'] },
+        { label: '勉强过关·但学到了配合',   icon: '🤝', rarity: 'A', weight: 30, levelBoost: 2, unlocks: ['chain_shrek_2'] },
+        { label: '表现不佳·但积累了经验',   icon: '📈', rarity: 'B', weight: 20, levelBoost: 1 },
+        { label: '拖了团队后腿·被批评',     icon: '😔', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'chain_shrek_2', title: '🔗 七怪试炼·默契', icon: '🤝', minLevel: 35, maxLevel: 58, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['chain_shrek_1'],
+    prelude: '试炼第二阶段——你被分到了和唐三、小舞一队，对抗戴沐白、朱竹清和马红俊的组合。3v3！这需要极高的默契。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美默契·碾压对手！！',   icon: '⚡', rarity: 'SSS', weight: 12, levelBoost: 5, unlocks: ['chain_shrek_3'], worldImpact: { tangSan: { affinity: 15 }, xiaoWu: { affinity: 15 } } },
+        { label: '激烈对抗·最终险胜',       icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 4, unlocks: ['chain_shrek_3'] },
+        { label: '精彩对决·虽败犹荣',       icon: '🤝', rarity: 'S', weight: 30, levelBoost: 3, unlocks: ['chain_shrek_3'] },
+        { label: '配合失误·但队友不怪你',   icon: '😅', rarity: 'A', weight: 23, levelBoost: 2 },
+        { label: '被完败·但有收获',         icon: '💪', rarity: 'B', weight: 10, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'chain_shrek_3', title: '🔗 七怪试炼·羁绊', icon: '🌟', minLevel: 40, maxLevel: 62, rarity: 'SSS', isMilestone: true, enemyPower: 3000,
+    requiredEvents: ['chain_shrek_2'],
+    prelude: '最终试炼——七怪将面对一位真正的封号斗罗！弗兰德院长请来了赵无极。这将是一场不可能赢的战斗——但七怪从不退缩。"一起上！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '七怪同心·逼退封号斗罗！！', icon: '🏆', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { tangSan: { affinity: 25 }, xiaoWu: { affinity: 20 }, daiMuBai: { affinity: 20 }, oscar: { affinity: 15 }, maHongJun: { affinity: 15 }, ningRongRong: { affinity: 15 }, zhuZhuQing: { affinity: 15 } } },
+        { label: '坚持到底·虽败犹荣',         icon: '💪', rarity: 'SS', weight: 30, levelBoost: 5, worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '用智慧找到破绽·取得先机',   icon: '🧠', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '被秒杀·但七怪保护了你',     icon: '🛡️', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '退缩了·自责不已',           icon: '😔', rarity: 'B', weight: 10, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3000)
+    },
+  },
+
+  // ==================== 剧情链2：武魂殿暗流（Lv.40-60） ====================
+  {
+    id: 'chain_wuhun_1', title: '🔗 武魂殿暗流·密信', icon: '✉️', minLevel: 40, maxLevel: 68, rarity: 'SS', isMilestone: true,
+    prelude: '你截获了一封武魂殿的密信——信中提到了一个代号为"净化"的秘密计划。如果这个计划成功，将会有成千上万的魂师被清除。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '深入调查·揭开冰山一角', icon: '🔍', rarity: 'SSS', weight: 15, levelBoost: 4, unlocks: ['chain_wuhun_2'] },
+        { label: '将密信交给可靠的人',     icon: '📨', rarity: 'SS', weight: 25, levelBoost: 3, unlocks: ['chain_wuhun_2'] },
+        { label: '暗中追踪·收集情报',     icon: '🕵️', rarity: 'S', weight: 28, levelBoost: 3, unlocks: ['chain_wuhun_2'] },
+        { label: '不关我事·扔掉了密信',   icon: '🗑️', rarity: 'B', weight: 22, levelBoost: 1 },
+        { label: '交给武魂殿换取赏金',     icon: '💰', rarity: 'C', weight: 10, levelBoost: 2, worldImpact: { biBiDong: { affinity: 10 } } },
+      ]
+    },
+  },
+  {
+    id: 'chain_wuhun_2', title: '🔗 武魂殿暗流·潜入', icon: '🏚️', minLevel: 45, maxLevel: 68, rarity: 'SSS', isMilestone: true, enemyPower: 3500,
+    requiredEvents: ['chain_wuhun_1'],
+    prelude: '你需要潜入武魂殿的一处秘密据点获取更多情报。守卫森严，一步走错就是万劫不复。但为了真相——你决定冒险。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '完美潜入·获得核心情报！！', icon: '🎯', rarity: 'SSS', weight: 10, levelBoost: 6, unlocks: ['chain_wuhun_3'] },
+        { label: '成功潜入·获得重要情报',     icon: '📄', rarity: 'SS', weight: 22, levelBoost: 4, unlocks: ['chain_wuhun_3'] },
+        { label: '被发觉·但成功逃脱',         icon: '🏃', rarity: 'S', weight: 25, levelBoost: 3, unlocks: ['chain_wuhun_3'] },
+        { label: '差点被抓·只拿到碎片情报',   icon: '😰', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '被俘·但被神秘人救出',       icon: '🦸', rarity: 'B', weight: 18, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3500)
+    },
+  },
+  {
+    id: 'chain_wuhun_3', title: '🔗 武魂殿暗流·揭露', icon: '📢', minLevel: 50, maxLevel: 72, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_wuhun_2'],
+    prelude: '你已经掌握了足够的情报。"净化"计划的真相令人发指——比比东打算利用猎魂行动清除所有不服从武魂殿的魂师。你必须做出选择。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '公开揭露·阻止计划！！', icon: '📢', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { biBiDong: { affinity: -80, faction: 'enemy' } } },
+        { label: '暗中破坏·从内部瓦解',   icon: '🕸️', rarity: 'SS', weight: 25, levelBoost: 5, worldImpact: { biBiDong: { affinity: -30 } } },
+        { label: '联合各方·共同对抗',     icon: '🤝', rarity: 'S', weight: 30, levelBoost: 4, worldImpact: { biBiDong: { affinity: -40 } } },
+        { label: '保存证据·等待时机',     icon: '📦', rarity: 'A', weight: 20, levelBoost: 2 },
+        { label: '太危险了·选择沉默',     icon: '🤫', rarity: 'B', weight: 10, levelBoost: 1 },
+      ]
+    },
+  },
+
+  // ==================== 剧情链3：冰火传承（Lv.35-55） ====================
+  {
+    id: 'chain_icefire_1', title: '🔗 冰火传承·药圃危机', icon: '🌡️', minLevel: 35, maxLevel: 60, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['iceFireWell'],
+    prelude: '独孤博的冰火两仪眼药圃遭到了不明魂兽的入侵！他最珍贵的几株仙草被啃食殆尽。独孤博暴怒——"小子，帮老夫找出那头畜生！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '追踪到凶手·是万年钻地龙', icon: '🐉', rarity: 'SS', weight: 20, levelBoost: 4, unlocks: ['chain_icefire_2'] },
+        { label: '设陷阱捕获·获得兽骨',     icon: '🪤', rarity: 'S', weight: 25, levelBoost: 3, unlocks: ['chain_icefire_2'], soulBone: { slot: 'leftLeg', beast: '万年钻地龙', year: 50000, skill: '钻地突袭', rarity: 'S' } },
+        { label: '发现是人为破坏的痕迹',     icon: '🔍', rarity: 'SSS', weight: 12, levelBoost: 4, unlocks: ['chain_icefire_2'] },
+        { label: '没找到·独孤博自己解决了', icon: '🤷', rarity: 'B', weight: 28, levelBoost: 1 },
+        { label: '魂兽太强·受了重伤',       icon: '🤕', rarity: 'C', weight: 15, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'chain_icefire_2', title: '🔗 冰火传承·幕后黑手', icon: '🕵️', minLevel: 40, maxLevel: 60, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_icefire_1'],
+    prelude: '调查发现——破坏药圃的不是魂兽，而是武魂殿的人！他们想削弱独孤博的实力，逼他交出冰火两仪眼的控制权。独孤博脸色铁青。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '与独孤博联手·反击武魂殿', icon: '⚔️', rarity: 'SSS', weight: 15, levelBoost: 5, unlocks: ['chain_icefire_3'], worldImpact: { duGuBo: { affinity: 40 } } },
+        { label: '设计陷阱·反制武魂殿',     icon: '🪤', rarity: 'SS', weight: 25, levelBoost: 4, unlocks: ['chain_icefire_3'], worldImpact: { duGuBo: { affinity: 20 } } },
+        { label: '劝独孤博暂避锋芒',         icon: '🤫', rarity: 'S', weight: 28, levelBoost: 3, unlocks: ['chain_icefire_3'] },
+        { label: '不参与·独孤博自己处理',   icon: '🙅', rarity: 'B', weight: 22, levelBoost: 1 },
+        { label: '把情报卖给武魂殿',         icon: '💰', rarity: 'C', weight: 10, worldImpact: { duGuBo: { affinity: -50 }, biBiDong: { affinity: 15 } } },
+      ]
+    },
+  },
+  {
+    id: 'chain_icefire_3', title: '🔗 冰火传承·毒丹传承', icon: '💊', minLevel: 45, maxLevel: 65, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_icefire_2'],
+    prelude: '独孤博在战斗中受了重伤——他的本命毒丹彻底碎裂了。临终前，他将你叫到床前。"老夫一生没有传人。这冰火两仪眼……还有我的毒丹心得……就交给你了。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接受传承·继承冰火两仪眼！！', icon: '🌿', rarity: 'SSS', weight: 20, levelBoost: 10, worldImpact: { duGuBo: { affinity: 80, legacy: true } } },
+        { label: '接受毒丹心得·获得毒系能力',   icon: '🧪', rarity: 'SS', weight: 30, levelBoost: 7, worldImpact: { duGuBo: { affinity: 40 } } },
+        { label: '用仙草救回独孤博·他活了下来', icon: '💚', rarity: 'SSS', weight: 15, levelBoost: 5, worldImpact: { duGuBo: { affinity: 100, alive: true } } },
+        { label: '婉拒·这份传承太重了',         icon: '🙏', rarity: 'S', weight: 20, levelBoost: 3, worldImpact: { duGuBo: { affinity: 20 } } },
+        { label: '趁他虚弱·独吞药圃所有仙草',   icon: '😈', rarity: 'C', weight: 15, levelBoost: 8, worldImpact: { duGuBo: { affinity: -100 } } },
+      ]
+    },
+  },
+
+  // ==================== 剧情链4：魂兽之谜（Lv.25-50） ====================
+  {
+    id: 'chain_beast_1', title: '🔗 魂兽之谜·远古咆哮', icon: '🐉', minLevel: 25, maxLevel: 55, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['enterForest'],
+    prelude: '星斗大森林深处传来了一声惊天动地的咆哮——那是天青牛蟒的声音！它在呼唤什么？小舞的脸色突然变得苍白。"糟了……它遇到了麻烦。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '和小舞一起深入调查',       icon: '🏃', rarity: 'SSS', weight: 15, levelBoost: 4, unlocks: ['chain_beast_2'], worldImpact: { xiaoWu: { affinity: 15 } } },
+        { label: '独自前往·让她留下',       icon: '🧍', rarity: 'SS', weight: 20, levelBoost: 3, unlocks: ['chain_beast_2'] },
+        { label: '召集其他人一起去',         icon: '📢', rarity: 'S', weight: 28, levelBoost: 2, unlocks: ['chain_beast_2'] },
+        { label: '太危险·还是不去',         icon: '🙅', rarity: 'B', weight: 25, levelBoost: 1 },
+        { label: '趁乱猎取魂兽·获取魂环',   icon: '⚔️', rarity: 'C', weight: 12, levelBoost: 3, soulRing: { year: 10000, colorName: '万年', colorHex: '#212121', beast: '万年魂兽', skill: '兽魂之力' } },
+      ]
+    },
+  },
+  {
+    id: 'chain_beast_2', title: '🔗 魂兽之谜·守护者', icon: '🐂', minLevel: 30, maxLevel: 55, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_beast_1'],
+    prelude: '你终于见到了天青牛蟒——星斗大森林的守护者之一。它受了重伤。在它身边，泰坦巨猿正在用魂力维持着它的生命。"人类……我们需要你的帮助。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '帮助治疗·获得守护者的信任', icon: '💚', rarity: 'SSS', weight: 15, levelBoost: 6, unlocks: ['chain_beast_3'], worldImpact: { xiaoWu: { affinity: 30 } } },
+        { label: '寻找草药·帮助恢复',         icon: '🌿', rarity: 'SS', weight: 28, levelBoost: 4, unlocks: ['chain_beast_3'] },
+        { label: '守护它们·抵挡武魂殿追兵',   icon: '🛡️', rarity: 'S', weight: 25, levelBoost: 5, unlocks: ['chain_beast_3'] },
+        { label: '趁机获取魂环·被小舞阻止',   icon: '😔', rarity: 'B', weight: 20, levelBoost: 2, worldImpact: { xiaoWu: { affinity: -20 } } },
+        { label: '通知武魂殿·这里有十万年魂兽', icon: '📢', rarity: 'C', weight: 12, levelBoost: 3, worldImpact: { xiaoWu: { affinity: -80 } } },
+      ]
+    },
+  },
+  {
+    id: 'chain_beast_3', title: '🔗 魂兽之谜·真相', icon: '🔮', minLevel: 35, maxLevel: 60, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_beast_2'],
+    prelude: '天青牛蟒恢复后，告诉了你一个千古秘密——远古时期，魂兽和人类曾经和平共处。直到一位人类神祇背叛了契约，引发了持续万年的战争。而武魂殿的猎魂行动，是为了收集魂兽的力量复活那位邪神！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '发誓守护这个秘密·阻止邪神复活', icon: '🤞', rarity: 'SSS', weight: 20, levelBoost: 8, worldImpact: { xiaoWu: { affinity: 40 } } },
+        { label: '将真相告诉唐三·联合对抗',       icon: '🤝', rarity: 'SS', weight: 30, levelBoost: 5, worldImpact: { tangSan: { affinity: 20 }, xiaoWu: { affinity: 15 } } },
+        { label: '决定调查邪神复活的线索',         icon: '🔍', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '半信半疑·但愿意帮忙',           icon: '🤔', rarity: 'A', weight: 15, levelBoost: 2 },
+        { label: '把秘密告诉武魂殿·但他们不信',   icon: '🤷', rarity: 'B', weight: 10, levelBoost: 1 },
+      ]
+    },
+  },
+
+  // ==================== 剧情链5：神位觉醒（Lv.60-95） ====================
+  {
+    id: 'chain_god_1', title: '🔗 神位觉醒·模糊感应', icon: '🌫️', minLevel: 60, maxLevel: 80, rarity: 'SS', isMilestone: true,
+    prelude: '你开始做奇怪的梦——梦中你站在云端，下方是整个斗罗大陆。一个声音在呼唤你，但隔着一层迷雾，你始终听不清它在说什么。这绝不是普通的梦。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '主动追寻梦中的声音',       icon: '🔮', rarity: 'SSS', weight: 15, levelBoost: 4, unlocks: ['chain_god_2'] },
+        { label: '向大师请教梦的含义',       icon: '📖', rarity: 'SS', weight: 25, levelBoost: 3, unlocks: ['chain_god_2'] },
+        { label: '在修炼中感应到神力波动',   icon: '🌀', rarity: 'S', weight: 28, levelBoost: 3, unlocks: ['chain_god_2'] },
+        { label: '忽视它·继续修炼',         icon: '🙅', rarity: 'B', weight: 22, levelBoost: 1 },
+        { label: '噩梦连连·魂力紊乱',       icon: '😰', rarity: 'C', weight: 10, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'chain_god_2', title: '🔗 神位觉醒·考验降临', icon: '⚡', minLevel: 68, maxLevel: 88, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_god_1'],
+    prelude: '一道神光从天而降——神的考验正式降临在你身上！这不是魂师的战斗，而是意志与灵魂的较量。你必须在神之领域中证明自己。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '通过考验·神位清晰显现！！', icon: '🌟', rarity: 'SSS', weight: 15, levelBoost: 8, unlocks: ['chain_god_3'] },
+        { label: '通过考验·但神位模糊',       icon: '🌫️', rarity: 'SS', weight: 25, levelBoost: 5, unlocks: ['chain_god_3'] },
+        { label: '在考验中顿悟·境界提升',     icon: '💡', rarity: 'S', weight: 30, levelBoost: 6, unlocks: ['chain_god_3'] },
+        { label: '考验失败·但获得神界祝福',   icon: '🙏', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '被神威所伤·但未放弃',       icon: '🤕', rarity: 'B', weight: 10, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'chain_god_3', title: '🔗 神位觉醒·神之抉择', icon: '🔱', minLevel: 80, maxLevel: 98, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chain_god_2'],
+    prelude: '神界诸神齐聚于你面前——每一位都向你伸出了手。海神、修罗神、天使神、火神……你只能选择一位。每一个选择都意味着完全不同的神位与命运。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '选择海神·守护海洋与生命',   icon: '🌊', rarity: 'SSS', weight: 15, levelBoost: 10 },
+        { label: '选择修罗神·执掌杀戮与审判', icon: '⚔️', rarity: 'SSS', weight: 15, levelBoost: 10 },
+        { label: '自创神位·开辟全新道路！！', icon: '💫', rarity: 'SSS', weight: 10, levelBoost: 12 },
+        { label: '选择火神·焚尽世间邪恶',     icon: '🔥', rarity: 'SS', weight: 20, levelBoost: 7 },
+        { label: '选择风神·自由翱翔天际',     icon: '💨', rarity: 'SS', weight: 18, levelBoost: 6 },
+        { label: '无法抉择·请求更多时间',     icon: '🤔', rarity: 'A', weight: 12, levelBoost: 3 },
+        { label: '拒绝所有·以凡人之躯比肩神明', icon: '💪', rarity: 'S', weight: 10, levelBoost: 5 },
+      ]
+    },
+  },
+  {
+    id: 'interact_tangSanNight', title: '🌙 月光下的唐三', icon: '🌿', minLevel: 10, maxLevel: 100, rarity: 'A',
+    prelude: '夜深了，你却看到一个人影在月光下做着奇怪的动作——是唐三。他在修炼一种你从未见过的功法。他注意到了你……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '静静观看·被唐三发现后交流', icon: '👀', rarity: 'SS', weight: 20, levelBoost: 2, worldImpact: { tangSan: { met: true, affinity: 15 } } },
+        { label: '上前请教·唐三演示玄天功',   icon: '🙋', rarity: 'SSS', weight: 15, levelBoost: 3, worldImpact: { tangSan: { met: true, affinity: 25 } } },
+        { label: '和他一起修炼·受益匪浅',     icon: '🧘', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { tangSan: { met: true, affinity: 20 } } },
+        { label: '假装没看见·转身离开',       icon: '🚶', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '想偷学但被发现了',           icon: '😅', rarity: 'C', weight: 10, worldImpact: { tangSan: { met: true, affinity: -5 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_xiaoWuCarrot', title: '🥕 小舞的胡萝卜', icon: '🐰', minLevel: 10, maxLevel: 100, rarity: 'A',
+    prelude: '小舞手里捧着一堆胡萝卜，看到你后眼睛一亮："喂！你要不要来一根？这可是星斗大森林里最好吃的胡萝卜！"她边说边递了一根过来……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '欣然接受·聊起星斗大森林', icon: '🥕', rarity: 'SS', weight: 20, levelBoost: 2, worldImpact: { xiaoWu: { met: true, affinity: 15 } } },
+        { label: '问她关于魂兽的知识',       icon: '💬', rarity: 'SSS', weight: 15, levelBoost: 3, worldImpact: { xiaoWu: { met: true, affinity: 20 } } },
+        { label: '分享自己的食物·互赠礼物', icon: '🎁', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { xiaoWu: { met: true, affinity: 25 } } },
+        { label: '婉拒·不饿',               icon: '🙂', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '怀疑胡萝卜有问题',         icon: '🤨', rarity: 'C', weight: 10, worldImpact: { xiaoWu: { met: true, affinity: -5 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_masterTest', title: '📝 大师的测试', icon: '📖', minLevel: 12, maxLevel: 100, rarity: 'S',
+    prelude: '玉小刚——大师——拿着一本厚厚的笔记找到了你。"我观察你很久了。你的魂环配置……很有意思。愿意配合我做一个小测试吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '全力配合·大师大为赞赏',   icon: '✅', rarity: 'SSS', weight: 15, levelBoost: 3, worldImpact: { yuXiaoGang: { met: true, affinity: 30 } } },
+        { label: '配合测试·获得修炼建议',   icon: '📊', rarity: 'SS', weight: 25, levelBoost: 2, worldImpact: { yuXiaoGang: { met: true, affinity: 15 } } },
+        { label: '质疑他的理论·引发辩论',   icon: '💬', rarity: 'S', weight: 22, levelBoost: 2, worldImpact: { yuXiaoGang: { met: true, affinity: 10 } } },
+        { label: '婉拒·不想当实验品',       icon: '🙅', rarity: 'B', weight: 28, levelBoost: 1 },
+        { label: '故意给出错误数据',         icon: '😏', rarity: 'C', weight: 10, worldImpact: { yuXiaoGang: { met: true, affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_daiChallenge', title: '👊 戴沐白的挑战', icon: '🦁', minLevel: 22, maxLevel: 100, rarity: 'A', isMilestone: true,
+    prelude: '戴沐白走了过来，眼中闪烁着战意："听说你最近进步很大。怎么样，和我切磋一场？点到为止。"他露出虎牙笑了起来。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '正面应战·打出精彩对决', icon: '⚔️', rarity: 'SSS', weight: 12, levelBoost: 4, worldImpact: { daiMuBai: { met: true, affinity: 25 } } },
+        { label: '接受切磋·互相学习',       icon: '🤝', rarity: 'SS', weight: 22, levelBoost: 3, worldImpact: { daiMuBai: { met: true, affinity: 15 } } },
+        { label: '以智取胜·不硬拼',         icon: '🧠', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { daiMuBai: { met: true, affinity: 10 } } },
+        { label: '认输·实力差距太大',       icon: '🏳️', rarity: 'B', weight: 25, levelBoost: 1 },
+        { label: '偷袭取胜·但戴沐白不悦',   icon: '👊', rarity: 'C', weight: 16, worldImpact: { daiMuBai: { met: true, affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_rongHelp', title: '💎 宁荣荣的求助', icon: '🏯', minLevel: 18, maxLevel: 100, rarity: 'A',
+    prelude: '宁荣荣拿着一张小纸条，上面列满了稀奇古怪的材料名称。"这些都是辅助修炼需要的……我一个人实在采集不完。你能不能帮帮我？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '帮她找齐材料·收获友谊',   icon: '🤝', rarity: 'SSS', weight: 15, levelBoost: 3, worldImpact: { ningRongRong: { met: true, affinity: 25 } } },
+        { label: '帮她一半·各自忙碌',       icon: '🤲', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { ningRongRong: { met: true, affinity: 10 } } },
+        { label: '建议她找其他人帮忙',       icon: '💡', rarity: 'A', weight: 28, levelBoost: 1 },
+        { label: '自己忙·没时间',           icon: '⏰', rarity: 'B', weight: 22 },
+        { label: '偷偷藏起最珍贵的材料',     icon: '🫣', rarity: 'C', weight: 10, worldImpact: { ningRongRong: { met: true, affinity: -15 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_oscarSnack', title: '🌭 奥斯卡的香肠', icon: '🍖', minLevel: 20, maxLevel: 100, rarity: 'B',
+    prelude: '"老兄！来一根恢复大香肠！"奥斯卡举着一根冒着热气的香肠向你推销，"吃了我奥斯卡的香肠，保证你立刻满血复活！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '吃下·魂力真的恢复了！',   icon: '✨', rarity: 'SS', weight: 20, levelBoost: 2, worldImpact: { oscar: { met: true, affinity: 15 } } },
+        { label: '买几根留着以后用',         icon: '🛒', rarity: 'S', weight: 22, levelBoost: 1, worldImpact: { oscar: { met: true, affinity: 20 } } },
+        { label: '对他的武魂表示好奇并交流', icon: '💬', rarity: 'SSS', weight: 12, levelBoost: 3, worldImpact: { oscar: { met: true, affinity: 25 } } },
+        { label: '拒绝·不饿',               icon: '🙅', rarity: 'B', weight: 30 },
+        { label: '嘲笑食物系武魂没用',       icon: '😤', rarity: 'C', weight: 16, worldImpact: { oscar: { met: true, affinity: -20 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_fattyPhoenix', title: '🔥 马红俊的烦恼', icon: '🐦', minLevel: 24, maxLevel: 100, rarity: 'B',
+    prelude: '马红俊一脸郁闷地坐在石头上——他的邪火又压不住了。"兄弟……帮我想想办法。这邪火再压不住，我就要自燃了。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '用冰系力量帮他镇压邪火',   icon: '❄️', rarity: 'SSS', weight: 12, levelBoost: 3, worldImpact: { maHongJun: { met: true, affinity: 30 } } },
+        { label: '陪他去找大师想办法',       icon: '🏃', rarity: 'SS', weight: 20, levelBoost: 2, worldImpact: { maHongJun: { met: true, affinity: 15 } } },
+        { label: '建议他发泄出去·陪练',     icon: '⚔️', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { maHongJun: { met: true, affinity: 20 } } },
+        { label: '没办法·无能为力',         icon: '🤷', rarity: 'B', weight: 28 },
+        { label: '远远躲开·怕被波及',       icon: '🏃', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'interact_zhuTraining', title: '🐱 朱竹清的特训', icon: '💨', minLevel: 30, maxLevel: 100, rarity: 'A',
+    prelude: '朱竹清在树林中独自训练——她的速度已经快到你几乎看不清她的身影。她停下来看了你一眼："想一起练吗？速度方面，我有一些心得。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '一起修炼·速度大幅提升',  icon: '💨', rarity: 'SSS', weight: 15, levelBoost: 4, worldImpact: { zhuZhuQing: { met: true, affinity: 20 } } },
+        { label: '请教她的敏攻技巧',        icon: '🙋', rarity: 'SS', weight: 25, levelBoost: 2, worldImpact: { zhuZhuQing: { met: true, affinity: 15 } } },
+        { label: '互相切磋·各有所获',      icon: '⚔️', rarity: 'S', weight: 28, levelBoost: 3, worldImpact: { zhuZhuQing: { met: true, affinity: 10 } } },
+        { label: '跟不上她的速度·放弃',    icon: '😰', rarity: 'B', weight: 22, levelBoost: 1 },
+        { label: '觉得她太冷淡·不愿交流',  icon: '🥶', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'interact_liuErLong', title: '🐉 柳二龙的怒火', icon: '🔥', minLevel: 35, maxLevel: 60, rarity: 'S',
+    prelude: '柳二龙——蓝电霸王龙家族的强者——正在大发雷霆。她刚刚发现有人在偷她的龙芝草！她瞪着你："是不是你？！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '冷静解释·帮她抓到真凶',   icon: '🧠', rarity: 'SSS', weight: 12, levelBoost: 4, worldImpact: { liuErLong: { met: true, affinity: 30 } } },
+        { label: '自证清白·提供线索',       icon: '🔍', rarity: 'SS', weight: 22, levelBoost: 3, worldImpact: { liuErLong: { met: true, affinity: 15 } } },
+        { label: '和她一起追查小偷',         icon: '🏃', rarity: 'S', weight: 28, levelBoost: 2, worldImpact: { liuErLong: { met: true, affinity: 20 } } },
+        { label: '被误会·争吵后离开',       icon: '😤', rarity: 'B', weight: 23, worldImpact: { liuErLong: { met: true, affinity: -10 } } },
+        { label: '真的偷了一株龙芝草',       icon: '🌿', rarity: 'C', weight: 15, levelBoost: 3, worldImpact: { liuErLong: { met: true, affinity: -30 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_qianRenXue', title: '👼 神秘的金发女子', icon: '✨', minLevel: 38, maxLevel: 100, rarity: 'SS', isMilestone: true,
+    prelude: '一位金发女子站在悬崖边，背后展开着六只洁白的羽翼——天使武魂！她转过身，金色的眼眸注视着你："你……能感受到吗？神界的气息。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '与她交流神位的秘密',       icon: '💬', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { qianRenXue: { met: true, affinity: 20 } } },
+        { label: '感受到共鸣·魂力波动',     icon: '🌀', rarity: 'SS', weight: 20, levelBoost: 4, worldImpact: { qianRenXue: { met: true, affinity: 10 } } },
+        { label: '警惕地保持距离',           icon: '🛡️', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '她很快飞走了·留下一片羽毛', icon: '🪶', rarity: 'S', weight: 22, levelBoost: 2, worldImpact: { qianRenXue: { met: true, affinity: 5 } } },
+        { label: '攻击她·但她轻松化解',     icon: '⚔️', rarity: 'C', weight: 16, worldImpact: { qianRenXue: { met: true, affinity: -20 } } },
+      ]
+    },
+  },
+
+  // ==================== 原著互动：阵营事件 ====================
+  {
+    id: 'interact_tangAlly', title: '🤝 与唐三并肩', icon: '🌿', minLevel: 35, maxLevel: 100, rarity: 'SS', isMilestone: true,
+    prelude: '唐三找到了你——武魂殿的追兵正在逼近。"我需要一个人帮我布置陷阱。你愿意和我一起战斗吗？"他的眼神坚定而信任。命运之轮，请转动——',
+    computeOptions(state) {
+      const tangFriend = state.relationships?.tangSan?.faction === 'friend'
+      if (!tangFriend) return [{ label: '你还不是唐三的战友', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '完美配合·全歼追兵！！',   icon: '⚔️', rarity: 'SSS', weight: 20, levelBoost: 5, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '成功击退·默契加深',       icon: '🤝', rarity: 'SS', weight: 30, levelBoost: 3, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '唐三救了受伤的你',         icon: '🩹', rarity: 'S', weight: 25, levelBoost: 2, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '战术失误·但唐三不离不弃', icon: '😔', rarity: 'A', weight: 25, levelBoost: 1, worldImpact: { tangSan: { affinity: 10 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_huLienaRival', title: '🦊 胡列娜的暗斗', icon: '👁️', minLevel: 35, maxLevel: 65, rarity: 'SS',
+    prelude: '胡列娜——武魂殿圣女——在阴影中注视着你。"你和我，迟早会有一战。但在此之前……我想看看你的真正实力。"命运之轮，请转动——',
+    computeOptions(state) {
+      const wxFriend = state.relationships?.biBiDong?.faction === 'friend'
+      if (!wxFriend) return [{ label: '你不在武魂殿阵营', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '展现全部实力·获得她的尊重', icon: '💪', rarity: 'SSS', weight: 15, levelBoost: 4, worldImpact: { huLiena: { met: true, affinity: 20 } } },
+        { label: '隐藏实力·故意示弱',         icon: '🕶️', rarity: 'SS', weight: 25, levelBoost: 2, worldImpact: { huLiena: { met: true, affinity: 5 } } },
+        { label: '提出合作·共谋大业',         icon: '🤝', rarity: 'S', weight: 28, levelBoost: 3, worldImpact: { huLiena: { met: true, affinity: 15 } } },
+        { label: '婉拒切磋·不感兴趣',         icon: '🙅', rarity: 'B', weight: 22 },
+        { label: '挑衅她·引发冲突',           icon: '😤', rarity: 'C', weight: 10, worldImpact: { huLiena: { met: true, affinity: -25 } } },
+      ]
+    },
+  },
+
+  // ==================== 原著互动：深交事件 ====================
+  {
+    id: 'interact_tangTrust', title: '📜 玄天宝录', icon: '📕', minLevel: 40, maxLevel: 80, rarity: 'SSS',
+    prelude: '唐三犹豫了很久，终于从怀中取出一本发黄的书册——玄天宝录。"这是我唐门的至高功法。我从未给任何人看过。但你……值得我信任。"命运之轮，请转动——',
+    computeOptions(state) {
+      const close = (state.relationships?.tangSan?.affinity || 0) >= 20
+      if (!close) return [{ label: '唐三还不够信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '学习玄天功·实力飞跃！！',   icon: '✨', rarity: 'SSS', weight: 25, levelBoost: 8, worldImpact: { tangSan: { affinity: 40 } } },
+        { label: '学习鬼影迷踪·身法大成',     icon: '💨', rarity: 'SS', weight: 35, levelBoost: 5, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '婉拒·太珍贵了不能收',       icon: '🙏', rarity: 'S', weight: 20, levelBoost: 2, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '看不懂·但唐三耐心讲解',     icon: '📖', rarity: 'A', weight: 20, levelBoost: 3, worldImpact: { tangSan: { affinity: 10 } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_xiaoWuSecret', title: '🐰 小舞的秘密', icon: '💔', minLevel: 35, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '小舞单独找到你，眼中带着泪光。"我……我有一件事必须告诉你。我不是人类。我是十万年魂兽——柔骨兔化形。如果武魂殿知道我的真实身份，他们会不惜一切代价来抓我。"命运之轮，请转动——',
+    computeOptions(state) {
+      const close = (state.relationships?.xiaoWu?.affinity || 0) >= 20
+      if (!close) return [{ label: '小舞还不够信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '发誓守护她的秘密·羁绊永固', icon: '🤞', rarity: 'SSS', weight: 30, levelBoost: 6, worldImpact: { xiaoWu: { affinity: 50 } } },
+        { label: '不惊讶·早就猜到了',         icon: '😌', rarity: 'SS', weight: 25, levelBoost: 3, worldImpact: { xiaoWu: { affinity: 20 } } },
+        { label: '建议她离开大陆·躲避武魂殿', icon: '⛵', rarity: 'S', weight: 20, levelBoost: 2, worldImpact: { xiaoWu: { affinity: 10 } } },
+        { label: '犹豫不决·不知如何回应',     icon: '😰', rarity: 'A', weight: 15, levelBoost: 1 },
+        { label: '把这个秘密告诉了别人',       icon: '😈', rarity: 'C', weight: 10, worldImpact: { xiaoWu: { affinity: -100, faction: 'enemy' } } },
+      ]
+    },
+  },
+  {
+    id: 'interact_bibiTrust', title: '👸 比比东的赏识', icon: '⛪', minLevel: 50, maxLevel: 85, rarity: 'SSS',
+    prelude: '比比东女皇传召你进入教皇殿的密室——这是极少有人能进入的地方。"你的表现令我印象深刻。我想给你一个特殊任务——一个只有我最信任的人才能执行的任务。"命运之轮，请转动——',
+    computeOptions(state) {
+      const close = (state.relationships?.biBiDong?.affinity || 0) >= 15
+      if (!close) return [{ label: '比比东还不够信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '接受任务·成为心腹！！',     icon: '🤝', rarity: 'SSS', weight: 25, levelBoost: 7, worldImpact: { biBiDong: { affinity: 40 } } },
+        { label: '接受但保持警惕',             icon: '👀', rarity: 'SS', weight: 30, levelBoost: 4, worldImpact: { biBiDong: { affinity: 15 } } },
+        { label: '婉拒·不想涉足太深',         icon: '🙅', rarity: 'S', weight: 20, levelBoost: 2, worldImpact: { biBiDong: { affinity: -10 } } },
+        { label: '接受后暗中破坏她的计划',     icon: '🕵️', rarity: 'A', weight: 15, levelBoost: 3, worldImpact: { biBiDong: { affinity: -50 } } },
+        { label: '任务失败·被迁怒',           icon: '😰', rarity: 'C', weight: 10, worldImpact: { biBiDong: { affinity: -30 } } },
+      ]
+    },
+  },
+  {
+    id: 'wx_promotion', title: '⚜️ 武魂殿晋升', icon: '⛪', minLevel: 53, maxLevel: 68, rarity: 'SS',
+    requiredEvents: ['huntStarted'],
+    prelude: '武魂殿内部举行晋升考核。你的表现将决定你在武魂殿中的地位——是成为核心成员，还是被边缘化？命运之轮，请转动——',
+    computeOptions(state) {
+      const isWx = state.relationships?.biBiDong?.faction === 'friend'
+      if (!isWx) return [{ label: '你不是武魂殿成员', icon: '🚫', rarity: 'C', weight: 100 }]
+      return [
+        { label: '晋升为红衣主教！！', icon: '🔴', rarity: 'SSS', weight: 10, levelBoost: 6, worldImpact: { biBiDong: { affinity: 30 } } },
+        { label: '成为核心成员',       icon: '⭐', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '普通成员·稳步提升', icon: '📈', rarity: 'A', weight: 35, levelBoost: 2 },
+        { label: '被排挤·但暗中学到秘术', icon: '🕵️', rarity: 'S', weight: 20, levelBoost: 3 },
+        { label: '考核失败·被降职',   icon: '📉', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'wx_huntRebels', title: '⚜️ 猎杀反抗军', icon: '🎯', minLevel: 55, maxLevel: 72, rarity: 'S', enemyPower: 4000,
+    requiredEvents: ['huntStarted'],
+    prelude: '教皇比比东亲自下令——清剿反抗军残余势力。你被派往前线执行任务。命运之轮，请转动——',
+    computeOptions(state) {
+      const isWx = state.relationships?.biBiDong?.faction === 'friend'
+      if (!isWx) return [{ label: '你不是武魂殿成员', icon: '🚫', rarity: 'C', weight: 100 }]
+      const base = [
+        { label: '大获全胜·受到比比东嘉奖', icon: '🏆', rarity: 'SSS', weight: 12, levelBoost: 5 },
+        { label: '完成任务·但放走了平民',   icon: '🤫', rarity: 'SS', weight: 25, levelBoost: 3 },
+        { label: '遇到旧友·陷入两难',       icon: '😰', rarity: 'S', weight: 28, levelBoost: 2 },
+        { label: '任务失败·被处罚',         icon: '😔', rarity: 'B', weight: 20 },
+        { label: '良心发现·暗中帮助反抗军', icon: '💚', rarity: 'A', weight: 15, levelBoost: 1, worldImpact: { biBiDong: { affinity: -30 }, tangSan: { affinity: 20 } } },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 4000)
+    },
+  },
+  // ==================== 分支路径 Lv.51+: 反抗军路线 ====================
+  {
+    id: 'fs_underground', title: '🛡️ 地下反抗军', icon: '🏚️', minLevel: 53, maxLevel: 68, rarity: 'SS',
+    requiredEvents: ['huntStarted'],
+    prelude: '反抗军被迫转入地下。你需要建立秘密据点、招募新成员、策划反击。这是一场看不见的战争——命运之轮，请转动——',
+    computeOptions(state) {
+      const isFs = state.relationships?.biBiDong?.faction === 'enemy'
+      if (!isFs) return [{ label: '你不是反抗军成员', icon: '🚫', rarity: 'C', weight: 100 }]
+      return [
+        { label: '建立地下网络·反抗军壮大！！', icon: '🕸️', rarity: 'SSS', weight: 12, levelBoost: 5, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '成功招募关键人物',             icon: '🤝', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '据点被袭·但成功转移',         icon: '🏃', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '内部出现叛徒·损失惨重',       icon: '🐍', rarity: 'B', weight: 18 },
+        { label: '被武魂殿发现·被迫转移',       icon: '🚚', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'fs_assassination', title: '🛡️ 刺杀计划', icon: '🗡️', minLevel: 56, maxLevel: 74, rarity: 'SSS', enemyPower: 12000,
+    requiredEvents: ['huntStarted'],
+    prelude: '反抗军高层制定了一个大胆的计划——刺杀武魂殿的一名封号斗罗！这将是对武魂帝国的致命打击，但成功率不到一成。命运之轮，请转动——',
+    computeOptions(state) {
+      const isFs = state.relationships?.biBiDong?.faction === 'enemy'
+      if (!isFs) return [{ label: '你不是反抗军成员', icon: '🚫', rarity: 'C', weight: 100 }]
+      return [
+        { label: '刺杀成功·武魂殿震动！！', icon: '💀', rarity: 'SSS', weight: 8, levelBoost: 8, worldImpact: { biBiDong: { affinity: -80 } } },
+        { label: '重伤目标·任务完成一半',   icon: '🩸', rarity: 'SS', weight: 15, levelBoost: 5 },
+        { label: '计划取消·改为智取',       icon: '🧠', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '中了埋伏·艰难逃脱',       icon: '🏃', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '行动失败·同伴牺牲',       icon: '😢', rarity: 'C', weight: 24 },
+      ]
+    },
+  },
+  {
+    id: 'fs_alliance', title: '🛡️ 联军组建', icon: '🤝', minLevel: 58, maxLevel: 76, rarity: 'SS',
+    requiredEvents: ['huntStarted'],
+    prelude: '反抗军需要联合所有反对武魂殿的势力。七宝琉璃宗、天斗帝国残部、隐世宗门……每一个盟友都至关重要。命运之轮，请转动——',
+    computeOptions(state) {
+      const isFs = state.relationships?.biBiDong?.faction === 'enemy'
+      if (!isFs) return [{ label: '你不是反抗军成员', icon: '🚫', rarity: 'C', weight: 100 }]
+      return [
+        { label: '成功联合三大势力！！', icon: '🏴', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { alliedForces: true } },
+        { label: '说服七宝琉璃宗加盟',   icon: '💎', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '说服天斗残部加盟',     icon: '👑', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '谈判陷入僵局',         icon: '⏸️', rarity: 'A', weight: 20, levelBoost: 1 },
+        { label: '被离间·联盟破裂',     icon: '💔', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+  {
+    id: 'gengxinForge', title: '庚辛城锻造', icon: '⚒️', minLevel: 52, maxLevel: 68, rarity: 'S',
+    prelude: '庚辛城——金属之都！这里的铁匠能打造出足以媲美魂导器的装备。一位老铁匠看了你的武魂后眼睛一亮："你的武魂……很适合打造一件本命武器！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '打造出本命神器！！', icon: '🗡️', rarity: 'SSS', weight: 5, levelBoost: 6, soulBone: { slot: 'rightArm', beast: '本命神器融合', year: 100000, skill: '神器一击', rarity: 'SSS' } },
+        { label: '打造出极品魂导器',   icon: '🔮', rarity: 'SS', weight: 18, levelBoost: 4 },
+        { label: '学到锻造精髓',       icon: '📖', rarity: 'A', weight: 32, levelBoost: 2 },
+        { label: '材料不足·半成品',   icon: '🔩', rarity: 'B', weight: 25 },
+        { label: '锻造失败·但也长了见识', icon: '💥', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'sevenClans', title: '七大宗会盟', icon: '🏳️', minLevel: 54, maxLevel: 70, rarity: 'SS',
+    prelude: '七大宗门在武魂帝国的压力下决定会盟。你被邀请作为观察员出席——但会场暗流涌动，有人试图破坏会盟！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '揭露阴谋·促成会盟！！', icon: '🎭', rarity: 'SSS', weight: 8, levelBoost: 5, worldImpact: { sevenClans: { allied: true } } },
+        { label: '保护关键人物·会盟成功', icon: '🛡️', rarity: 'SS', weight: 20, levelBoost: 4 },
+        { label: '中立调停·部分成功',     icon: '⚖️', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '阴谋得逞·会盟破裂',     icon: '💔', rarity: 'B', weight: 22 },
+        { label: '被卷入暗杀·受伤',       icon: '🗡️', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'tiandouCoup', title: '天斗宫变', icon: '🏰', minLevel: 56, maxLevel: 72, rarity: 'SSS', enemyPower: 7000,
+    prelude: '天斗帝国皇宫内发生了政变！皇位继承人雪崩被软禁——武魂殿在背后操控一切。你恰好身在皇宫附近……命运之轮，请转动——',
+    computeOptions(state) {
+      const antiWuHun = state.relationships?.biBiDong?.faction === 'enemy'
+      return [
+        { label: '救出雪崩·挫败政变！！', icon: '👑', rarity: 'SSS', weight: antiWuHun ? 20 : 5, levelBoost: 8, worldImpact: { xueBeng: { saved: true, affinity: 50 } } },
+        { label: '暗中协助保皇派',       icon: '🕵️', rarity: 'SS', weight: 18, levelBoost: 5, worldImpact: { xueBeng: { saved: true, affinity: 20 } } },
+        { label: '保持中立·观望局势',   icon: '👀', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '趁乱谋取利益',         icon: '💰', rarity: 'B', weight: 24 },
+        { label: '被误认为叛军·逃亡',   icon: '🏃', rarity: 'C', weight: 25 },
+      ]
+    },
+  },
+  {
+    id: 'avatarTrial', title: '武魂真身试炼', icon: '🦸', minLevel: 57, maxLevel: 74, rarity: 'SS', isMilestone: true, enemyPower: 6000,
+    prelude: '武魂真身是每一位魂师的里程碑！但突破武魂真身需要经历一次生死考验——你的武魂将在极限中蜕变！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美真身·武魂再度进化！！', icon: '🌟', rarity: 'SSS', weight: 5, levelBoost: 7 },
+        { label: '成功突破·获得武魂真身',     icon: '💪', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '勉强突破·真身不稳定',       icon: '⚡', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '突破失败·但魂力大增',       icon: '📈', rarity: 'B', weight: 23, levelBoost: 2 },
+        { label: '走火入魔·但意外打通经脉',   icon: '🌀', rarity: 'S', weight: 20, levelBoost: 4 },
+      ]
+    },
+  },
+  {
+    id: 'hiddenWeaponDev', title: '暗器研发', icon: '🔫', minLevel: 58, maxLevel: 75, rarity: 'S',
+    requiredEvents: ['tangSectWeapons'],
+    prelude: '唐门暗器图谱的灵感让你有了新的想法——能否将魂力与暗器结合，创造出这个时代闻所未闻的武器？命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '研发出魂力暗器·佛怒唐莲改！！', icon: '💥', rarity: 'SSS', weight: 8, levelBoost: 7 },
+        { label: '改良诸葛神弩·威力倍增',       icon: '🏹', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '初步完成原型·潜力巨大',         icon: '🔧', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '实验失败·销毁了材料',           icon: '💣', rarity: 'B', weight: 20 },
+        { label: '方向错误·但也排除了一个选项',   icon: '🚫', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+
+  // ==================== 新增 Lv.71-90: 封号之路 ====================
+  {
+    id: 'douluoTower', title: '封号试炼塔', icon: '🗼', minLevel: 73, maxLevel: 88, rarity: 'SS', isMilestone: true, enemyPower: 2800,
+    prelude: '封号斗罗试炼塔——九层宝塔，每层都有陨落封号斗罗留下的残魂考验。登顶者得封号！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '九层登顶·残魂赐福！！', icon: '🏆', rarity: 'SSS', weight: 6, levelBoost: 10 },
+        { label: '通过七层·获得认可',     icon: '⬆️', rarity: 'SS', weight: 20, levelBoost: 6 },
+        { label: '通过五层·小有所成',     icon: '📊', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '三层止步·但收获颇丰',   icon: '🛑', rarity: 'B', weight: 24, levelBoost: 2 },
+        { label: '第一层就失败了·但不气馁', icon: '💪', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'seaReturn', title: '海神归来', icon: '🌊', minLevel: 75, maxLevel: 90, rarity: 'SSS',
+    requiredEvents: ['seaGodTrial'],
+    prelude: '海神岛的历练让你脱胎换骨！现在，你的归来将改变大陆的战局——大陆上的朋友们还不知道你已经变得如此强大。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '以海神之力扭转战局！！', icon: '🔱', rarity: 'SSS', weight: 10, levelBoost: 8, worldImpact: { tangSan: { affinity: 30 }, biBiDong: { affinity: -40 } } },
+        { label: '秘密部署·一击制胜',     icon: '🎯', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '召集旧部·重新组建力量', icon: '🤝', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '低调行事·暗中介入',     icon: '🕶️', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '发现大陆已面目全非',     icon: '😔', rarity: 'B', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'godOmen', title: '神位预兆', icon: '🌠', minLevel: 78, maxLevel: 93, rarity: 'SSS',
+    prelude: '你开始频繁地做梦——梦中你站在云端，俯视着整个斗罗大陆。一个声音在呼唤你……神界的召唤越来越清晰！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '清晰感应到神位召唤！！', icon: '🔮', rarity: 'SSS', weight: 10, levelBoost: 6, unlocks: ['godPath'] },
+        { label: '获得神界的碎片信息',     icon: '🧩', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '梦中遇到一位神祇',       icon: '💭', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '梦很模糊·但心中有感',   icon: '🌫️', rarity: 'A', weight: 23, levelBoost: 1 },
+        { label: '噩梦连连·魂力不稳',     icon: '😰', rarity: 'B', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'lastTraitor', title: '最后的叛徒', icon: '🐍', minLevel: 76, maxLevel: 90, rarity: 'S', enemyPower: 10000,
+    prelude: '你的阵营中出现了一个叛徒！机密情报不断外泄，而所有的线索都指向了你最信任的人之一……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '智破叛徒·反间计成功！！', icon: '🧠', rarity: 'SSS', weight: 10, levelBoost: 5, worldImpact: { traitor: { exposed: true } } },
+        { label: '设局抓捕·清除内鬼',       icon: '🪤', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '将计就计·利用假情报',     icon: '🎭', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '信任的人果然是叛徒',       icon: '💔', rarity: 'A', weight: 22, levelBoost: 2 },
+        { label: '冤枉了好人·但真凶暴露',   icon: '😔', rarity: 'B', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'nearDeath', title: '九死一生', icon: '💀', minLevel: 77, maxLevel: 92, rarity: 'SS',
+    enemyPower: 30000,
+    prelude: '你被三名封号斗罗联手围攻！三人武魂真身齐开——你暗中评估差距：如果战力不够，今天恐怕凶多吉少……命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '绝境突破·反杀三人！！', icon: '⚡', rarity: 'SSS', weight: 4, levelBoost: 12 },
+        { label: '重伤逃脱·但境界突破',   icon: '🏃', rarity: 'SS', weight: 15, levelBoost: 8 },
+        { label: '被神秘人救下·欠下人情', icon: '🦸', rarity: 'S', weight: 28, levelBoost: 5, worldImpact: { mysteriousSavior: { met: true, affinity: 20 } } },
+        { label: '勉强存活·失去装备',     icon: '📉', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '假死脱身·暗中疗伤',     icon: '🪦', rarity: 'A', weight: 23, levelBoost: 3 },
+        { label: '奇迹逆转·以一敌三',     icon: '⚡', rarity: 'SSS', weight: 1, levelBoost: 15 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 4000)
+    },
+  },
+
+  // ==================== 新增 Lv.91-100: 神位之争 ====================
+  {
+    id: 'godRealmThree', title: '神界三关', icon: '🚪', minLevel: 92, maxLevel: 100, rarity: 'SSS', enemyPower: 40000,
+    prelude: '神界的入口是一道由三关守护的天门。第一关：心魔关；第二关：力量关；第三关：智慧关。只有通过三关者才能觐见神王！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '三关全通·神王接见！！', icon: '🌟', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '通过两关·获得神界认可', icon: '✅', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '通过一关·还需努力',     icon: '🔄', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '心魔关中顿悟',          icon: '💡', rarity: 'S', weight: 20, levelBoost: 5 },
+        { label: '三关全败·但没放弃',    icon: '💪', rarity: 'B', weight: 18, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'godChoice', title: '神位抉择', icon: '⚖️', minLevel: 94, maxLevel: 100, rarity: 'SSS',
+    prelude: '多位神祇向你抛出了橄榄枝——海神、修罗神、天使神……每一个神位都有不同的权柄和责任。你必须做出选择！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '海神·守护大海与生命',   icon: '🌊', rarity: 'SSS', weight: 15, levelBoost: 5 },
+        { label: '修罗神·执掌杀戮与审判', icon: '⚔️', rarity: 'SSS', weight: 15, levelBoost: 5 },
+        { label: '火神·焚尽邪恶',         icon: '🔥', rarity: 'SS', weight: 20, levelBoost: 4 },
+        { label: '风神·自由翱翔',         icon: '💨', rarity: 'SS', weight: 18, levelBoost: 4 },
+        { label: '拒绝所有·自创神位',     icon: '💫', rarity: 'SSS', weight: 12, levelBoost: 8 },
+        { label: '犹豫不决·延迟选择',     icon: '🤔', rarity: 'A', weight: 20, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'ascension', title: '飞升大典', icon: '☁️', minLevel: 96, maxLevel: 100, rarity: 'SSS',
+    prelude: '飞升之日！整个斗罗大陆的魂师都注视着天空。金色的光柱从天而降，神界之门为你打开！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '完美飞升·神光万丈！！', icon: '✨', rarity: 'SSS', weight: 15, levelBoost: 6 },
+        { label: '顺利飞升·进入神界',     icon: '⬆️', rarity: 'SS', weight: 30, levelBoost: 4 },
+        { label: '飞升受阻·但被神王亲自迎接', icon: '👑', rarity: 'SSS', weight: 10, levelBoost: 5 },
+        { label: '选择暂留大陆·未完成之事',   icon: '⏸️', rarity: 'S', weight: 25, levelBoost: 2 },
+        { label: '飞升失败·但已触碰神之领域', icon: '🤏', rarity: 'A', weight: 20, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'stayMortal', title: '留世之路', icon: '🏞️', minLevel: 95, maxLevel: 100, rarity: 'S',
+    prelude: '并非每一个触摸神之领域的人都必须飞升。有些神选择留在斗罗大陆，以凡人之躯守护这片土地。你站在了抉择的十字路口——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '选择留世·成为大陆守护神', icon: '🛡️', rarity: 'SSS', weight: 20, levelBoost: 4, worldImpact: { stayMortal: true } },
+        { label: '飞升神界·俯瞰众生',       icon: '☁️', rarity: 'SS', weight: 25, levelBoost: 5 },
+        { label: '建立传承后再飞升',         icon: '📜', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '无法抉择·继续游历',       icon: '🧳', rarity: 'A', weight: 15, levelBoost: 2 },
+        { label: '散尽神力·归于平凡',       icon: '🍂', rarity: 'B', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'eternalSeal', title: '永恒封印', icon: '🔐', minLevel: 97, maxLevel: 100, rarity: 'SSS',
+    prelude: '一个远古的邪恶存在正在苏醒！如果让它完全复活，整个斗罗大陆将陷入永恒的黑暗。封印它的唯一方法是——牺牲一位神祇的全部神力。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '牺牲神力·封印邪恶！！', icon: '💔', rarity: 'SSS', weight: 15, levelBoost: 3, worldImpact: { evilSealed: true } },
+        { label: '寻找其他方法·暂时压制', icon: '🔍', rarity: 'SS', weight: 25, levelBoost: 5 },
+        { label: '联合其他神祇共同封印',   icon: '🤝', rarity: 'S', weight: 30, levelBoost: 4, worldImpact: { evilSealed: true } },
+        { label: '无法面对·逃离',         icon: '🏃', rarity: 'C', weight: 12 },
+        { label: '与邪恶谈判·达成平衡',   icon: '⚖️', rarity: 'A', weight: 18, levelBoost: 3 },
+      ]
+    },
+  },
+
+  // ==================== 角色故事线：唐三/小舞/戴沐白/宁荣荣/大师/唐昊/千仞雪 ====================
+  {
+    id: 'tang_forge', title: '🔨 唐三的锻造坊', icon: '⚒️', minLevel: 25, maxLevel: 50, rarity: 'SS',
+    requiredEvents: ['interact_tangSanNight'],
+    prelude: '唐三带你来到他秘密搭建的锻造坊。"锻造是唐门的根基。从选材到淬火，每一步都不能马虎。想学吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '学会锻造·获得唐门秘传', icon: '🔨', rarity: 'SSS', weight: 18, levelBoost: 5, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '打下手·学到基础',       icon: '🛠️', rarity: 'SS', weight: 30, levelBoost: 3, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '不感兴趣·交了朋友',     icon: '🤝', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '毁了材料·唐三苦笑',     icon: '😅', rarity: 'B', weight: 22, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'tang_oath', title: '🤜 七怪誓约', icon: '🌟', minLevel: 60, maxLevel: 90, rarity: 'SSS',
+    requiredEvents: ['interact_tangAlly'],
+    prelude: '大战前夕，唐三将你叫到一边。"无论明天发生什么——你是七怪的一员，永远都是。这份誓约，比任何魂环都珍贵。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '歃血为盟·羁绊永存！！', icon: '🩸', rarity: 'SSS', weight: 25, levelBoost: 8, worldImpact: { tangSan: { affinity: 50 } } },
+        { label: '郑重承诺·七怪同心',     icon: '🤝', rarity: 'SS', weight: 35, levelBoost: 5, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '感动落泪·一生兄弟',     icon: '😢', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '不知所措',              icon: '😶', rarity: 'A', weight: 15, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'xiaoWu_memory', title: '🌙 星斗记忆', icon: '🐰', minLevel: 20, maxLevel: 45, rarity: 'SS',
+    requiredEvents: ['interact_xiaoWuCarrot'],
+    prelude: '小舞在月光下发呆，眼中闪过一丝不属于人类的高傲与忧伤。"你想知道星斗大森林真正的样子吗？那里……曾经是我的家。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '静静倾听·感受她的孤独', icon: '👂', rarity: 'SSS', weight: 20, levelBoost: 4, worldImpact: { xiaoWu: { affinity: 30 } } },
+        { label: '承诺保守她的秘密',       icon: '🤞', rarity: 'SS', weight: 30, levelBoost: 3, worldImpact: { xiaoWu: { affinity: 20 } } },
+        { label: '不理解·但尊重她',       icon: '🤷', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '太多愁善感',            icon: '😐', rarity: 'B', weight: 22, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'xiaoWu_guardian', title: '🛡️ 守护之誓', icon: '💍', minLevel: 50, maxLevel: 80, rarity: 'SSS',
+    requiredEvents: ['interact_xiaoWuSecret'],
+    prelude: '武魂殿的封号斗罗再次出现——目标依然是小舞。你站在她面前，武魂全开。"谁也别想碰她。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '以一敌三·逼退封号斗罗！！', icon: '🛡️', rarity: 'SSS', weight: 15, levelBoost: 10, worldImpact: { xiaoWu: { affinity: 60 } } },
+        { label: '掩护她逃离·自己重伤',       icon: '🩸', rarity: 'SS', weight: 25, levelBoost: 7, worldImpact: { xiaoWu: { affinity: 40 } } },
+        { label: '设陷阱困住追兵',             icon: '🧠', rarity: 'S', weight: 30, levelBoost: 5, worldImpact: { xiaoWu: { affinity: 30 } } },
+        { label: '与追兵交易换安全',           icon: '🤝', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '犹豫了·小舞受伤',           icon: '😰', rarity: 'C', weight: 10, worldImpact: { xiaoWu: { affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'dai_letter', title: '✉️ 星罗来信', icon: '🦁', minLevel: 35, maxLevel: 65, rarity: 'SS',
+    requiredEvents: ['interact_daiChallenge'],
+    prelude: '戴沐白收到星罗帝国密信——他脸色大变。"我皇兄戴维斯正式向我宣战了。星罗皇位之争，我必须回去。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '承诺协助·成为后盾',       icon: '🤝', rarity: 'SSS', weight: 22, levelBoost: 5, worldImpact: { daiMuBai: { affinity: 30 } } },
+        { label: '建议联合史莱克一起行动',   icon: '👥', rarity: 'SS', weight: 30, levelBoost: 3, worldImpact: { daiMuBai: { affinity: 15 } } },
+        { label: '劝他冷静·从长计议',       icon: '🧠', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '不关我事',                icon: '🤷', rarity: 'B', weight: 20, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'dai_throne', title: '👑 皇位之战', icon: '🏰', minLevel: 55, maxLevel: 80, rarity: 'SSS',
+    requiredEvents: ['dai_letter'],
+    prelude: '戴沐白的皇位之战到了关键时刻！戴维斯请来了武魂殿封号斗罗助阵。他需要你——最信任的战友。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '联手击败戴维斯·沐白登基！！', icon: '👑', rarity: 'SSS', weight: 15, levelBoost: 10, worldImpact: { daiMuBai: { affinity: 50 } } },
+        { label: '牵制武魂殿·沐白公平对决',     icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 6, worldImpact: { daiMuBai: { affinity: 30 } } },
+        { label: '智取·瓦解戴维斯联盟',         icon: '🧠', rarity: 'S', weight: 30, levelBoost: 5 },
+        { label: '沐白失败·一起逃亡',           icon: '🏃', rarity: 'A', weight: 20, levelBoost: 4 },
+        { label: '临阵退缩',                    icon: '😔', rarity: 'C', weight: 10, worldImpact: { daiMuBai: { affinity: -30 } } },
+      ]
+    },
+  },
+  {
+    id: 'rong_clan', title: '🏯 宗门召唤', icon: '💎', minLevel: 30, maxLevel: 58, rarity: 'SS',
+    requiredEvents: ['interact_rongHelp'],
+    prelude: '宁荣荣收到七宝琉璃宗的紧急召唤——宗门遭遇袭击！她哭着找你："我不知道该怎么办……宗门需要我，但我太弱了！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '陪她回去·共同击退敌人',   icon: '🛡️', rarity: 'SSS', weight: 18, levelBoost: 6, worldImpact: { ningRongRong: { affinity: 35 } } },
+        { label: '帮她分析局势·制定策略',   icon: '🧠', rarity: 'SS', weight: 28, levelBoost: 4, worldImpact: { ningRongRong: { affinity: 20 } } },
+        { label: '建议她向大师求助',         icon: '📖', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '太危险·婉拒了',           icon: '🙅', rarity: 'B', weight: 24, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'rong_evolution', title: '✨ 琉璃进化', icon: '💫', minLevel: 50, maxLevel: 75, rarity: 'SSS',
+    requiredEvents: ['rong_clan'],
+    prelude: '宁荣荣的七宝琉璃塔在进化！从七宝进化为九宝琉璃塔！但进化需要巨大的魂力支撑。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '输送魂力·见证九宝琉璃塔！！', icon: '✨', rarity: 'SSS', weight: 18, levelBoost: 8, worldImpact: { ningRongRong: { affinity: 50 } } },
+        { label: '守护她完成进化·获得祝福',     icon: '🙏', rarity: 'SS', weight: 30, levelBoost: 6, worldImpact: { ningRongRong: { affinity: 30 } } },
+        { label: '进化成功·你魂力透支',         icon: '😵', rarity: 'S', weight: 25, levelBoost: 4 },
+        { label: '魂力不够·进化中断',           icon: '💔', rarity: 'B', weight: 27, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'master_letter', title: '📜 大师的遗书', icon: '💌', minLevel: 60, maxLevel: 95, rarity: 'SSS',
+    prelude: '你收到一封玉小刚的信。"当你看到这封信时，我或许已经不在了。我一生最大的骄傲，就是见证了你和唐三的成长。记住——适合的，才是最好的。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '泪流满面·牢记大师教诲',   icon: '😢', rarity: 'SSS', weight: 30, levelBoost: 6, worldImpact: { yuXiaoGang: { affinity: 40 } } },
+        { label: '将理论整理成册·传承后世', icon: '📖', rarity: 'SS', weight: 35, levelBoost: 5, worldImpact: { yuXiaoGang: { affinity: 30 } } },
+        { label: '找到大师·他还活着！！',     icon: '😲', rarity: 'SSS', weight: 10, levelBoost: 8, worldImpact: { yuXiaoGang: { affinity: 50 } } },
+        { label: '信是假的·武魂殿陷阱',     icon: '⚠️', rarity: 'A', weight: 15, levelBoost: 3 },
+        { label: '太过悲伤',                icon: '💔', rarity: 'B', weight: 10, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'tangHao_appear', title: '🔨 昊天斗罗', icon: '💪', minLevel: 30, maxLevel: 65, rarity: 'SSS', isMilestone: true,
+    prelude: '一个扛着巨大昊天锤的独臂男人拦住了你的去路——唐昊！"你身上有我儿子的气息。告诉我，他怎么样了？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '如实告知·唐昊微微点头',   icon: '✅', rarity: 'SSS', weight: 20, levelBoost: 5, worldImpact: { tangHao: { met: true, affinity: 25 } } },
+        { label: '请他指点修炼·受益匪浅',   icon: '💪', rarity: 'SS', weight: 30, levelBoost: 6, worldImpact: { tangHao: { met: true, affinity: 20 } } },
+        { label: '被他测试·勉强通过',       icon: '😰', rarity: 'S', weight: 25, levelBoost: 3, worldImpact: { tangHao: { met: true, affinity: 10 } } },
+        { label: '被气势震慑',              icon: '😱', rarity: 'B', weight: 25, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'qianxue_trial', title: '👼 天使试炼', icon: '✨', minLevel: 60, maxLevel: 85, rarity: 'SSS',
+    requiredEvents: ['interact_qianRenXue'],
+    prelude: '千仞雪的六翼天使武魂完全展开，神圣光芒照亮了整片天空。"天使神的试炼即将开始。我需要一个见证者。你愿意来吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      const met = state.relationships?.qianRenXue?.met
+      if (!met) return [{ label: '你还没见过千仞雪', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '见证天使九考·获得天使祝福', icon: '👼', rarity: 'SSS', weight: 18, levelBoost: 8, worldImpact: { qianRenXue: { affinity: 40 } } },
+        { label: '帮她通过心魔关·建立羁绊',   icon: '💪', rarity: 'SS', weight: 28, levelBoost: 5, worldImpact: { qianRenXue: { affinity: 25 } } },
+        { label: '天使神威过强·无法靠近',     icon: '😰', rarity: 'B', weight: 25, levelBoost: 3 },
+        { label: '这是陷阱·没有上当',         icon: '🕵️', rarity: 'C', weight: 29, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'haotian_return', title: '⚡ 回归昊天宗', icon: '🏔️', minLevel: 55, maxLevel: 72, rarity: 'SSS',
+    prelude: '唐三站在昊天宗的山门前，五位长老的目光冰冷如刀。"唐昊之子，还有脸回来？"你站在唐三身边——命运之轮，请转动——',
+    computeOptions(state) {
+      const isClose = (state.relationships?.tangSan?.affinity || 0) >= 40
+      return [
+        { label: '为唐三作证·说服长老开山！！', icon: '🔨', rarity: 'SSS', weight: isClose ? 15 : 5, levelBoost: 10, worldImpact: { tangSan: { affinity: 50 }, tangHao: { affinity: 30 } } },
+        { label: '展现实力·赢得长老尊重',       icon: '💪', rarity: 'SS',  weight: 20, levelBoost: 8, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '保持沉默·唐三独自面对',       icon: '🤐', rarity: 'S',   weight: 28, levelBoost: 4, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '劝说放弃·宗门已腐朽',         icon: '😔', rarity: 'B',   weight: 18, worldImpact: { tangSan: { affinity: -10 } } },
+        { label: '站在长老一边',                icon: '⚖️', rarity: 'C',   weight: 19, levelBoost: 2, worldImpact: { tangSan: { affinity: -40 } } },
+      ]
+    },
+  },
+  {
+    id: 'haotian_legacy', title: '🔨 大须弥锤', icon: '💥', minLevel: 68, maxLevel: 88, rarity: 'SSS',
+    requiredEvents: ['haotian_return'],
+    prelude: '唐昊独臂举起昊天锤——"这是我昊天宗最强的自创魂技——大须弥锤！以身为锤，以魂为力。接好了！"命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || state.level * 10
+      return [
+        { label: '接下三锤·获得传承！！',       icon: '🔨', rarity: 'SSS', weight: power >= 5000 ? 15 : 4, levelBoost: 12, worldImpact: { tangHao: { affinity: 50 } } },
+        { label: '接下一锤·唐昊微微点头',       icon: '💪', rarity: 'SS',  weight: 20, levelBoost: 7, worldImpact: { tangHao: { affinity: 20 } } },
+        { label: '以智破解·唐昊赞赏',           icon: '🧠', rarity: 'S',   weight: 28, levelBoost: 5, worldImpact: { tangHao: { affinity: 15 } } },
+        { label: '被一锤击飞·但爬了起来',       icon: '😤', rarity: 'A',   weight: 25, levelBoost: 3, worldImpact: { tangHao: { affinity: 5 } } },
+        { label: '不敢接锤·被鄙视',             icon: '😔', rarity: 'C',   weight: 12, worldImpact: { tangHao: { affinity: -15 } } },
+      ]
+    },
+  },
+  // ==================== 原著重大事件：详细分支转盘 ====================
+  {
+    id: 'canon_shrekForm', title: '⚡ 史莱克七怪成立', icon: '🌟', minLevel: 30, maxLevel: 48, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['shrekEntrance'],
+    prelude: '弗兰德院长召集了学院最强的七名学生，郑重宣布——史莱克七怪正式成立！唐三、小舞、戴沐白、奥斯卡、马红俊、宁荣荣、朱竹清。弗兰德转向你："你虽非正式成员，但你与七怪的交情，让你有资格参与这次决定。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '全力支持·成为荣誉第八人！！', icon: '🤝', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { tangSan: { affinity: 30 }, xiaoWu: { affinity: 20 }, daiMuBai: { affinity: 20 }, oscar: { affinity: 15 }, maHongJun: { affinity: 15 }, ningRongRong: { affinity: 20 }, zhuZhuQing: { affinity: 15 } }, unlocks: ['shrekFormed'] },
+        { label: '独立参赛·走自己的路',         icon: '🧍', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '幕后支持·不做焦点',           icon: '🫶', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '接受特殊任务·暗中协助',       icon: '📜', rarity: 'A', weight: 20, levelBoost: 2 },
+        { label: '保持距离·独自修炼',           icon: '😒', rarity: 'C', weight: 15, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'canon_tournamentFinal', title: '⚡ 精英赛决战·武魂城', icon: '🏟️', minLevel: 42, maxLevel: 58, rarity: 'SSS', isMilestone: true,
+    prelude: '武魂城中央大斗魂场——全大陆精英赛决赛！教皇比比东亲临，整个大陆的目光聚集于此。对面是武魂殿最强战队。这一战决定你在大陆魂师界的地位——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '击败武魂殿·震惊大陆！！',   icon: '🏆', rarity: 'SSS', weight: 8, levelBoost: 12, worldImpact: { biBiDong: { met: true, affinity: -30 } } },
+        { label: '击败强敌·扬名立万',         icon: '🥇', rarity: 'SS', weight: 18, levelBoost: 8, worldImpact: { biBiDong: { met: true, affinity: -10 } } },
+        { label: '惜败·赢得全场尊重',         icon: '🥈', rarity: 'S', weight: 25, levelBoost: 6, worldImpact: { biBiDong: { met: true, affinity: 10 } } },
+        { label: '被暗算·揭露武魂殿阴谋',     icon: '🕵️', rarity: 'SS', weight: 15, levelBoost: 7, worldImpact: { biBiDong: { met: true, affinity: -50 } } },
+        { label: '弃权保存实力',              icon: '🏳️', rarity: 'A', weight: 18, levelBoost: 3 },
+        { label: '受伤·获全场致敬',           icon: '🩹', rarity: 'B', weight: 16, levelBoost: 4 },
+      ]
+    },
+  },
+  {
+    id: 'canon_haotianReturn', title: '⚡ 昊天宗回归', icon: '🔨', minLevel: 70, maxLevel: 90, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['tangHao_appear'],
+    prelude: '昊天宗——曾经天下第一宗门，因唐昊之事封闭山门二十年。唐三叩响了山门，五位长老的目光冰冷如刀。你站在唐三身边——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '为唐三作证·说服长老开山！！', icon: '🔨', rarity: 'SSS', weight: 12, levelBoost: 10, worldImpact: { tangSan: { affinity: 50 }, tangHao: { affinity: 30 } } },
+        { label: '展现实力·赢得尊重',           icon: '💪', rarity: 'SS', weight: 20, levelBoost: 8, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '沉默·让唐三自己面对',         icon: '🤐', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '劝说放弃·宗门已腐朽',         icon: '😔', rarity: 'B', weight: 18, levelBoost: 2, worldImpact: { tangSan: { affinity: -10 } } },
+        { label: '站在长老一边',                icon: '⚖️', rarity: 'C', weight: 12, levelBoost: 3, worldImpact: { tangSan: { affinity: -40 } } },
+        { label: '宗门内乱·被迫应战',           icon: '⚔️', rarity: 'S', weight: 10, levelBoost: 6 },
+      ]
+    },
+  },
+  {
+    id: 'canon_empireForm', title: '⚡ 武魂帝国成立', icon: '🏰', minLevel: 52, maxLevel: 68, rarity: 'SSS', isMilestone: true,
+    prelude: '武魂殿正式宣布立国——武魂帝国诞生！比比东登基称帝，整个大陆为之震动。所有魂师都被要求选择阵营——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '公开反对·加入天斗联军',       icon: '⚔️', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { biBiDong: { faction: 'enemy', affinity: -60 } } },
+        { label: '接受招揽·加入武魂帝国',       icon: '⛪', rarity: 'SS', weight: 18, levelBoost: 6, worldImpact: { biBiDong: { faction: 'friend', affinity: 40 } } },
+        { label: '保持中立·拒绝任何阵营',       icon: '⚖️', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '暗中组织反抗·地下行动',       icon: '🕵️', rarity: 'SS', weight: 15, levelBoost: 5, worldImpact: { biBiDong: { affinity: -30 } } },
+        { label: '逃往海神岛避祸',              icon: '⛵', rarity: 'A', weight: 14, levelBoost: 2 },
+        { label: '被强行征召·被迫参战',         icon: '🔗', rarity: 'C', weight: 10, levelBoost: 3, worldImpact: { biBiDong: { affinity: 10 } } },
+      ]
+    },
+  },
+  {
+    id: 'canon_jialingPass', title: '⚡ 嘉陵关决战', icon: '🏯', minLevel: 73, maxLevel: 88, rarity: 'SSS', isMilestone: true, enemyPower: 22000,
+    prelude: '武魂帝国百万大军压境嘉陵关——天斗帝国最后的屏障！唐三的海神之力与比比东的罗刹神力碰撞，天地变色。你的每一个决定都可能改变战局——命运之轮，请转动——',
+    computeOptions(state) {
+      const isAnti = state.relationships?.biBiDong?.faction === 'enemy'
+      const base = [
+        { label: '联手唐三·对抗比比东！！',   icon: '🤝', rarity: 'SSS', weight: isAnti ? 20 : 5, levelBoost: 12, worldImpact: { tangSan: { affinity: 40 }, biBiDong: { affinity: -80 } } },
+        { label: '指挥奇袭·智取粮草',         icon: '🧠', rarity: 'SS', weight: 18, levelBoost: 8, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '守护后方·保护伤员',         icon: '🛡️', rarity: 'S', weight: 22, levelBoost: 5 },
+        { label: '并肩唐昊·昊天锤荣耀',       icon: '🔨', rarity: 'SSS', weight: isAnti ? 12 : 3, levelBoost: 10, worldImpact: { tangHao: { affinity: 30 } } },
+        { label: '坐山观虎斗',                icon: '👀', rarity: 'B', weight: 15, levelBoost: 2 },
+        { label: '倒戈武魂帝国',              icon: '🔄', rarity: 'C', weight: 8, levelBoost: 5, worldImpact: { tangSan: { affinity: -80, faction: 'enemy' }, biBiDong: { affinity: 50 } } },
+        { label: '关陷·掩护百姓撤离',         icon: '🏃', rarity: 'C', weight: 10, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3000)
+    },
+  },
+  {
+    id: 'canon_godWar', title: '⚡ 双神之战', icon: '⚔️', minLevel: 95, maxLevel: 100, rarity: 'SSS', isMilestone: true, enemyPower: 100000,
+    prelude: '神界之门大开——海神唐三与罗刹神比比东的最终对决！两位神祇撕裂天空，整个大陆颤抖。你以凡人之躯站在战场边缘——命运之轮，请转动——',
+    computeOptions(state) {
+      const tangFriend = state.relationships?.tangSan?.faction === 'friend'
+      const base = [
+        { label: '凡人助神·击败罗刹！！',       icon: '🌟', rarity: 'SSS', weight: tangFriend ? 20 : 5, levelBoost: 15, worldImpact: { tangSan: { affinity: 80 }, biBiDong: { alive: false } } },
+        { label: '领域困神·智取罗刹',           icon: '🌐', rarity: 'SSS', weight: tangFriend ? 12 : 3, levelBoost: 12, worldImpact: { tangSan: { affinity: 50 }, biBiDong: { alive: false } } },
+        { label: '保护平民撤离',                icon: '🛡️', rarity: 'SS', weight: 20, levelBoost: 6, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '旁观·记录历史',               icon: '📖', rarity: 'S', weight: 22, levelBoost: 5 },
+        { label: '助纣为虐·帮比比东',           icon: '😈', rarity: 'C', weight: 8, levelBoost: 10, worldImpact: { tangSan: { affinity: -100, faction: 'enemy' }, biBiDong: { affinity: 80 } } },
+        { label: '神战余波所伤·幸存',           icon: '🤕', rarity: 'B', weight: 15, levelBoost: 7 },
+        { label: '双神同归于尽·你成最强',       icon: '💀', rarity: 'A', weight: 5, levelBoost: 20, worldImpact: { tangSan: { alive: false }, biBiDong: { alive: false } } },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 5000)
+    },
+  },
+
+  // ==================== 武魂融合技（原著核心系统） ====================
+  {
+    id: 'fusion_daiZhu', title: '🐯 幽冥白虎', icon: '🐅', minLevel: 45, maxLevel: 65, rarity: 'SSS', isMilestone: true,
+    prelude: '戴沐白和朱竹清同时找到了你——他们的武魂产生了共鸣！"幽冥白虎——只有双方完全信任才能使用的武魂融合技。你愿意和我们一起尝试吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      const dai = (state.relationships?.daiMuBai?.affinity || 0) >= 15
+      const zhu = (state.relationships?.zhuZhuQing?.affinity || 0) >= 15
+      if (!dai || !zhu) return [{ label: '戴沐白和朱竹清还不够信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '完美融合·觉醒幽冥之力！！', icon: '🐅', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { daiMuBai: { affinity: 30 }, zhuZhuQing: { affinity: 30 } } },
+        { label: '融合成功·战力短暂飙升',     icon: '⚡', rarity: 'SS', weight: 28, levelBoost: 6, worldImpact: { daiMuBai: { affinity: 20 }, zhuZhuQing: { affinity: 20 } } },
+        { label: '部分融合·学到融合原理',     icon: '📖', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '融合失败·三人受伤',         icon: '🤕', rarity: 'B', weight: 17, levelBoost: 2 },
+        { label: '拒绝尝试',                  icon: '🙅', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'fusion_tangXiao', title: '💫 双神共存', icon: '✨', minLevel: 50, maxLevel: 75, rarity: 'SSS', isMilestone: true,
+    prelude: '唐三和小舞的武魂产生了前所未有的共鸣——海神与修罗神的力量同时涌动！"双神共存——这是我父母留给我的最高奥秘。"命运之轮，请转动——',
+    computeOptions(state) {
+      const tang = (state.relationships?.tangSan?.affinity || 0) >= 25
+      const xiao = (state.relationships?.xiaoWu?.affinity || 0) >= 25
+      if (!tang || !xiao) return [{ label: '唐三和小舞还不够信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '见证双神共存·获得神级感悟！！', icon: '💫', rarity: 'SSS', weight: 12, levelBoost: 10, worldImpact: { tangSan: { affinity: 40 }, xiaoWu: { affinity: 40 } } },
+        { label: '感受神力·自身境界突破',         icon: '⚡', rarity: 'SS', weight: 25, levelBoost: 7 },
+        { label: '唐三单独传授·海神之秘',         icon: '🌊', rarity: 'S', weight: 30, levelBoost: 5, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '无法理解神的领域',               icon: '😵', rarity: 'B', weight: 23, levelBoost: 3 },
+        { label: '拒绝·不敢涉足神之领域',         icon: '🙅', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'fusion_player', title: '⚡ 武魂共鸣', icon: '🌀', minLevel: 55, maxLevel: 80, rarity: 'SS', isMilestone: true,
+    prelude: '你的武魂突然与一位同伴的武魂产生了共鸣——这是武魂融合的征兆！融合技是万中无一的奇迹。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '成功觉醒·自创武魂融合技！！', icon: '🌀', rarity: 'SSS', weight: 10, levelBoost: 10 },
+        { label: '部分共鸣·武魂增强',           icon: '⚡', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '共鸣不稳定·但学到知识',       icon: '📖', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '共鸣失败·但武魂更坚韧',       icon: '💪', rarity: 'B', weight: 23, levelBoost: 2 },
+        { label: '强行融合·反噬受伤',           icon: '🤕', rarity: 'C', weight: 15, levelBoost: 3 },
+      ]
+    },
+  },
+
+  // ==================== 八蛛矛外附魂骨 ====================
+  {
+    id: 'spiderLance_get', title: '🕷️ 八蛛矛', icon: '🕸️', minLevel: 35, maxLevel: 55, rarity: 'SSS', isMilestone: true,
+    prelude: '你在星斗大森林发现了一头千年人面魔蛛——它的外附魂骨是所有魂师梦寐以求的至宝！这是一次改变命运的猎杀。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得八蛛矛外附魂骨！！',   icon: '🦴', rarity: 'SSS', weight: 8, levelBoost: 6, soulBone: { slot: 'external', beast: '千年人面魔蛛', year: 6000, skill: '八蛛矛·剧毒穿刺', rarity: 'SS' } },
+        { label: '获得右臂魂骨',             icon: '💪', rarity: 'SS', weight: 20, levelBoost: 4, soulBone: { slot: 'rightArm', beast: '人面魔蛛', year: 5000, skill: '蛛网缠绕', rarity: 'A' } },
+        { label: '魔蛛逃入洞穴·追丢了',     icon: '🏃', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '被魔蛛毒液所伤·中毒了',   icon: '☠️', rarity: 'B', weight: 22, levelBoost: 3 },
+        { label: '情报有误·不是人面魔蛛',   icon: '😔', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'spiderLance_evolve', title: '🕷️ 八蛛矛进化', icon: '✨', minLevel: 55, maxLevel: 80, rarity: 'SSS', isMilestone: true,
+    prelude: '你的八蛛矛外附魂骨产生了异变——它在吸收你体内的魂力进行自我进化！如果进化成功，它将蜕变为传说中的「神级八蛛矛」。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '进化成功·神级八蛛矛！！', icon: '✨', rarity: 'SSS', weight: 10, levelBoost: 10, soulBone: { slot: 'external', beast: '神级八蛛矛', year: 100000, skill: '神级剧毒穿刺·领域', rarity: 'SSS' } },
+        { label: '部分进化·获得剧毒领域',   icon: '☠️', rarity: 'SS', weight: 22, levelBoost: 7, worldImpact: { domain: '剧毒领域' } },
+        { label: '进化失败·但魂骨增强',     icon: '📈', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '进化失控·暂时虚弱',       icon: '😵', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '放弃进化·保持现状',       icon: '🛑', rarity: 'C', weight: 18 },
+      ]
+    },
+  },
+
+  // ==================== 独孤博毒训 ====================
+  {
+    id: 'duguPoison_1', title: '☠️ 以毒炼体', icon: '🧪', minLevel: 35, maxLevel: 54, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['iceFireWell'],
+    prelude: '独孤博捻着胡须打量着你："小子，老夫看你根骨不错。想不想学学怎么用毒？不过先说好——以毒炼体的过程，比死还难受。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '坚持到底·获得抗毒体质！！', icon: '☠️', rarity: 'SSS', weight: 14, levelBoost: 5, worldImpact: { duGuBo: { affinity: 35 } } },
+        { label: '完成大半·获得部分抗毒',     icon: '💊', rarity: 'SS', weight: 26, levelBoost: 4, worldImpact: { duGuBo: { affinity: 20 } } },
+        { label: '中途放弃·但学了基础',       icon: '🛑', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '毒性过强·昏迷三天',         icon: '😵', rarity: 'B', weight: 18, levelBoost: 3 },
+        { label: '拒绝·太痛苦了',             icon: '🙅', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+  {
+    id: 'duguPoison_2', title: '☠️ 万毒不侵', icon: '🛡️', minLevel: 50, maxLevel: 70, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['duguPoison_1'],
+    prelude: '独孤博满意地看着你："你已经过了最难的阶段。现在是最后一步——服下老夫的本命毒丹炼制的万毒丹。成功，你将万毒不侵；失败……"他没有说下去。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '万毒不侵·获得毒免被动！！', icon: '🛡️', rarity: 'SSS', weight: 12, levelBoost: 8, worldImpact: { duGuBo: { affinity: 50 } } },
+        { label: '成功·获得高级毒抗',         icon: '✅', rarity: 'SS', weight: 25, levelBoost: 5, worldImpact: { duGuBo: { affinity: 25 } } },
+        { label: '部分成功·获得毒抗',         icon: '💊', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '失败·但未中毒',             icon: '😰', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '服毒失败·独孤博救了你',     icon: '🆘', rarity: 'C', weight: 13, levelBoost: 4, worldImpact: { duGuBo: { affinity: 15 } } },
+      ]
+    },
+  },
+
+  // ==================== Lv.80-100 后期填充 ====================
+  {
+    id: 'late_echo', title: '🌌 星斗回声', icon: '🌲', minLevel: 80, maxLevel: 90, rarity: 'SS', isMilestone: true,
+    prelude: '你再次踏入星斗大森林——这一次，你已是封号斗罗。天青牛蟒和泰坦巨猿同时出现在你面前，它们感受到了你体内涌动的神之气息。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得双兽王祝福·战力大增', icon: '🐂', rarity: 'SSS', weight: 12, levelBoost: 8, worldImpact: { xiaoWu: { affinity: 20 } } },
+        { label: '天青牛蟒献出魂骨',         icon: '🦴', rarity: 'SS', weight: 20, levelBoost: 6, soulBone: { slot: 'torso', beast: '天青牛蟒', year: 100000, skill: '天青守护', rarity: 'SS' } },
+        { label: '泰坦巨猿教你巨力之道',     icon: '🦍', rarity: 'S', weight: 28, levelBoost: 5 },
+        { label: '被兽王考验·勉强通过',     icon: '😰', rarity: 'B', weight: 22, levelBoost: 3 },
+        { label: '兽王不愿见你·离去',       icon: '😔', rarity: 'C', weight: 18 },
+      ]
+    },
+  },
+  {
+    id: 'late_godRift', title: '🌌 神界裂缝', icon: '💫', minLevel: 85, maxLevel: 95, rarity: 'SSS', isMilestone: true,
+    prelude: '天空裂开了——一道金色的裂缝中，神界的气息倾泻而出！这是万年难遇的机缘，也可能是致命的陷阱。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '吸收神界气息·境界飙升！！', icon: '💫', rarity: 'SSS', weight: 8, levelBoost: 12 },
+        { label: '获得神界碎片·炼化神器',     icon: '🔮', rarity: 'SS', weight: 18, levelBoost: 8 },
+        { label: '谨慎吸收·稳步提升',         icon: '📈', rarity: 'S', weight: 30, levelBoost: 5 },
+        { label: '裂缝不稳定·提前关闭',       icon: '😔', rarity: 'B', weight: 24, levelBoost: 3 },
+        { label: '被神界之力反噬·受伤',       icon: '🤕', rarity: 'C', weight: 20, levelBoost: 4 },
+      ]
+    },
+  },
+  {
+    id: 'late_duel', title: '⚔️ 封号对决', icon: '👑', minLevel: 88, maxLevel: 96, rarity: 'SSS', isMilestone: true,
+    prelude: '一位同级别的封号斗罗向你发起了挑战！这是封号斗罗之间的巅峰对决——整个大陆都在注视。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '碾压对手·威震大陆！！', icon: '💪', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '激战胜出·赢得尊重',     icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '险胜·但也学到很多',     icon: '😰', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '惜败·但对手承认你很强', icon: '🤝', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '惨败·但发现自身不足',   icon: '📉', rarity: 'B', weight: 12, levelBoost: 2 },
+        { label: '双方重伤·平局收场',     icon: '🩸', rarity: 'C', weight: 8, levelBoost: 5 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 15000)
+    },
+  },
+
+  // ==================== 七宝琉璃宗覆灭 ====================
+  {
+    id: 'clan_attack', title: '💔 琉璃之劫', icon: '💎', minLevel: 50, maxLevel: 65, rarity: 'SSS', isMilestone: true,
+    prelude: '噩耗传来——武魂殿夜袭七宝琉璃宗！宁风致重伤，宗门弟子死伤过半。宁荣荣哭着跪在你面前："求求你……救救我的家人！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '火速驰援·救下宁风致！！', icon: '🛡️', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { ningRongRong: { affinity: 50 } } },
+        { label: '阻击武魂殿追兵·掩护撤退', icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 6, worldImpact: { ningRongRong: { affinity: 30 } } },
+        { label: '暗中护送·成功转移',       icon: '🕵️', rarity: 'S', weight: 28, levelBoost: 4, worldImpact: { ningRongRong: { affinity: 20 } } },
+        { label: '来晚一步·宗门已成废墟',   icon: '💔', rarity: 'B', weight: 18, levelBoost: 2, worldImpact: { ningRongRong: { affinity: 10 } } },
+        { label: '选择明哲保身·没有参与',   icon: '😔', rarity: 'C', weight: 14, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'clan_rebuild', title: '💎 琉璃重建', icon: '🏯', minLevel: 65, maxLevel: 85, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['clan_attack'],
+    prelude: '七宝琉璃宗的废墟上，宁荣荣擦干眼泪。"我要重建宗门——让它比以前更强大。你愿意帮我吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      const close = (state.relationships?.ningRongRong?.affinity || 0) >= 10
+      if (!close) return [{ label: '宁荣荣还不信任你', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '全力协助·九宝琉璃塔祝福！！', icon: '💎', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { ningRongRong: { affinity: 50 } } },
+        { label: '提供资源·帮助重建',           icon: '💰', rarity: 'SS', weight: 25, levelBoost: 5, worldImpact: { ningRongRong: { affinity: 30 } } },
+        { label: '帮忙招募新弟子',               icon: '📢', rarity: 'S', weight: 28, levelBoost: 4, worldImpact: { ningRongRong: { affinity: 20 } } },
+        { label: '精神支持·但无法实际帮助',     icon: '🙏', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '拒绝·太忙了',                 icon: '🙅', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+
+  // ==================== 等级触发原著角色剧情 ====================
+  {
+    id: 'lvl_tangSan_15', title: '🌿 蓝银初现', icon: '🌱', minLevel: 12, maxLevel: 22, rarity: 'SSS', isMilestone: true,
+    prelude: '唐三的蓝银草在月光下泛起了蓝金色光芒。"你注意到了吗？我的武魂似乎有所不同。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '仔细观察·发现蓝银草的秘密', icon: '🔍', rarity: 'SSS', weight: 20, levelBoost: 3, worldImpact: { tangSan: { met: true, affinity: 20 } } },
+        { label: '鼓励唐三·相信他的武魂',     icon: '💚', rarity: 'SS', weight: 30, levelBoost: 2, worldImpact: { tangSan: { met: true, affinity: 15 } } },
+        { label: '不以为然·普通蓝银草而已',   icon: '🤷', rarity: 'B', weight: 28, levelBoost: 1 },
+        { label: '觉得他在开玩笑',             icon: '😅', rarity: 'C', weight: 22 },
+      ]
+    },
+  },
+  { id: 'lvl_xiaoWu_30', title: '🐰 柔骨之秘', icon: '🐇', minLevel: 25, maxLevel: 38, rarity: 'SSS', isMilestone: true,
+    prelude: '小舞找到你，神情犹豫。"我的柔骨兔……和其他兽武魂不太一样。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '静静倾听·获得她的信任', icon: '👂', rarity: 'SSS', weight: 18, levelBoost: 4, worldImpact: { xiaoWu: { met: true, affinity: 30 } } },
+        { label: '表示理解·不追问细节',   icon: '🤝', rarity: 'SS', weight: 30, levelBoost: 2, worldImpact: { xiaoWu: { met: true, affinity: 15 } } },
+        { label: '追问到底·她欲言又止',   icon: '😰', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '不关心·没什么特别',     icon: '🤷', rarity: 'C', weight: 27, levelBoost: 1 },
+      ]
+    },
+  },
+  { id: 'lvl_dai_40', title: '🐯 白虎之怒', icon: '👑', minLevel: 35, maxLevel: 48, rarity: 'SSS', isMilestone: true,
+    prelude: '戴沐白收到星罗密信——脸色铁青。"戴维斯终于按捺不住了。我需要回星罗。你愿意一起去吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '同行·共同面对星罗皇室', icon: '🤝', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { daiMuBai: { met: true, affinity: 35 } } },
+        { label: '帮他分析局势·制定策略', icon: '🧠', rarity: 'SS', weight: 28, levelBoost: 4, worldImpact: { daiMuBai: { met: true, affinity: 20 } } },
+        { label: '承诺需要时一定赶到',     icon: '🤞', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '婉拒·不想卷入皇室争斗', icon: '🙅', rarity: 'B', weight: 17, levelBoost: 1 },
+        { label: '趁机要报酬',             icon: '💰', rarity: 'C', weight: 10, levelBoost: 2, worldImpact: { daiMuBai: { met: true, affinity: -10 } } },
+      ]
+    },
+  },
+  { id: 'lvl_fatty_50', title: '🔥 邪火焚天', icon: '🐦', minLevel: 45, maxLevel: 58, rarity: 'SSS', isMilestone: true,
+    prelude: '马红俊浑身邪火包围，痛苦蜷缩。"帮帮我……邪火又失控了！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '冒险压制邪火·救下他！！', icon: '🧯', rarity: 'SSS', weight: 15, levelBoost: 6, worldImpact: { maHongJun: { met: true, affinity: 40 } } },
+        { label: '用冰寒之力镇压·成功',     icon: '❄️', rarity: 'SS', weight: 25, levelBoost: 4, worldImpact: { maHongJun: { met: true, affinity: 25 } } },
+        { label: '找唐三帮忙',              icon: '🏃', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '无法控制·他昏迷了',       icon: '😵', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '被邪火波及·自己受伤',     icon: '🔥', rarity: 'C', weight: 12, levelBoost: 3 },
+      ]
+    },
+  },
+  { id: 'lvl_rong_55', title: '💎 琉璃之变', icon: '✨', minLevel: 50, maxLevel: 63, rarity: 'SSS', isMilestone: true,
+    prelude: '宁荣荣的七宝琉璃塔自主发光——在进化！从七层变八层，隐隐有第九层虚影。"九宝琉璃塔是传说！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '输送魂力·见证九宝琉璃塔！！', icon: '💎', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { ningRongRong: { met: true, affinity: 40 } } },
+        { label: '守护她完成进化·获得祝福',     icon: '🙏', rarity: 'SS', weight: 28, levelBoost: 5, worldImpact: { ningRongRong: { met: true, affinity: 25 } } },
+        { label: '进化成功·她魂力透支',         icon: '😵', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '进化中断·还需机缘',           icon: '⏸️', rarity: 'B', weight: 17, levelBoost: 2 },
+        { label: '嫉妒·不帮忙',                 icon: '😒', rarity: 'C', weight: 10, worldImpact: { ningRongRong: { met: true, affinity: -15 } } },
+      ]
+    },
+  },
+  { id: 'lvl_zhu_65', title: '🐱 幽冥暗杀', icon: '🗡️', minLevel: 60, maxLevel: 73, rarity: 'SSS', isMilestone: true,
+    prelude: '朱竹清浑身是血敲开你的门——星罗刺客来了。"他们找到了我……戴维斯的暗杀队。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '联手反杀·全歼刺客！！', icon: '⚔️', rarity: 'SSS', weight: 12, levelBoost: 8, worldImpact: { zhuZhuQing: { met: true, affinity: 40 }, daiMuBai: { met: true, affinity: 15 } } },
+        { label: '设陷阱·智取刺客',       icon: '🧠', rarity: 'SS', weight: 25, levelBoost: 5, worldImpact: { zhuZhuQing: { met: true, affinity: 25 } } },
+        { label: '护送她逃离·暂时安全',   icon: '🏃', rarity: 'S', weight: 30, levelBoost: 4 },
+        { label: '害怕牵连·婉拒了',       icon: '😰', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '通知武魂殿·换取情报',   icon: '📢', rarity: 'C', weight: 13, levelBoost: 3, worldImpact: { zhuZhuQing: { met: true, affinity: -30 }, biBiDong: { met: true, affinity: 10 } } },
+      ]
+    },
+  },
+  { id: 'lvl_qianxue_75', title: '👼 天使降临', icon: '✨', minLevel: 70, maxLevel: 83, rarity: 'SSS', isMilestone: true,
+    prelude: '六翼天使圣光从天而降——千仞雪悬浮空中。"你的实力已引起天使神的注意。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接受天使试炼·证明自己', icon: '👼', rarity: 'SSS', weight: 12, levelBoost: 8, worldImpact: { qianRenXue: { met: true, affinity: 30 } } },
+        { label: '保持谦逊·通过心魔考验', icon: '🧘', rarity: 'SS', weight: 25, levelBoost: 6, worldImpact: { qianRenXue: { met: true, affinity: 20 } } },
+        { label: '质疑天使神·引发辩论',   icon: '💬', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '拒绝·不需要天使认可',   icon: '🙅', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '攻击她·被轻松化解',     icon: '⚔️', rarity: 'C', weight: 15, levelBoost: 3, worldImpact: { qianRenXue: { met: true, affinity: -20 } } },
+      ]
+    },
+  },
+  { id: 'lvl_tangHao_85', title: '🔨 昊天传承', icon: '💪', minLevel: 80, maxLevel: 93, rarity: 'SSS', isMilestone: true,
+    prelude: '唐昊独臂扛着昊天锤。"你走的路比唐三更远。你配得上昊天锤的传承吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接下昊天三锤·获得传承！！', icon: '🔨', rarity: 'SSS', weight: 10, levelBoost: 12, worldImpact: { tangHao: { met: true, affinity: 50 }, tangSan: { met: true, affinity: 20 } } },
+        { label: '接下一锤·唐昊微微点头',     icon: '💪', rarity: 'SS', weight: 22, levelBoost: 8, worldImpact: { tangHao: { met: true, affinity: 25 } } },
+        { label: '以智取胜·不硬接',           icon: '🧠', rarity: 'S', weight: 30, levelBoost: 5 },
+        { label: '被震飞·唐昊没下杀手',       icon: '💨', rarity: 'A', weight: 20, levelBoost: 3 },
+        { label: '不敢应战·被鄙视',           icon: '😔', rarity: 'C', weight: 18, levelBoost: 1, worldImpact: { tangHao: { met: true, affinity: -15 } } },
+      ]
+    },
+  },
+  { id: 'lvl_bibi_95', title: '👸 教皇终局', icon: '💀', minLevel: 90, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '比比东在教皇殿最深处召见你。"你已走到这一步。最后的机会——你站在哪一边？"命运之轮，请转动——',
+    computeOptions(state) {
+      const isEnemy = state.relationships?.biBiDong?.faction === 'enemy'
+      return [
+        { label: '正面对抗·拒绝屈服！！', icon: '⚔️', rarity: 'SSS', weight: isEnemy ? 25 : 8, levelBoost: 12, worldImpact: { biBiDong: { affinity: -100, faction: 'enemy' } } },
+        { label: '假意臣服·暗中图谋',     icon: '🕵️', rarity: 'SS', weight: 20, levelBoost: 6, worldImpact: { biBiDong: { affinity: 20 } } },
+        { label: '谈判·要求放弃猎魂行动', icon: '🤝', rarity: 'S', weight: 22, levelBoost: 5 },
+        { label: '接受招揽·加入武魂殿',   icon: '⛪', rarity: 'A', weight: 18, levelBoost: 8, worldImpact: { biBiDong: { affinity: 50, faction: 'friend' } } },
+        { label: '逃跑·不敢面对',         icon: '🏃', rarity: 'C', weight: 15, levelBoost: 2 },
+        { label: '被看穿·强行囚禁',       icon: '🔗', rarity: 'B', weight: 10, levelBoost: 4, worldImpact: { biBiDong: { affinity: -30 } } },
+      ]
+    },
+  },
+  { id: 'lvl_all_100', title: '🌟 传说之巅', icon: '👑', minLevel: 99, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '你站在了大陆巅峰——百级成神！所有伙伴齐聚。"无论你去哪里，你永远是七怪的一员。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '全员羁绊·传说不朽！！', icon: '🌟', rarity: 'SSS', weight: 25, levelBoost: 10, worldImpact: { tangSan: { affinity: 30 }, xiaoWu: { affinity: 30 }, daiMuBai: { affinity: 20 }, oscar: { affinity: 20 }, maHongJun: { affinity: 20 }, ningRongRong: { affinity: 20 }, zhuZhuQing: { affinity: 20 } } },
+        { label: '许下承诺·永远守护大陆', icon: '🤞', rarity: 'SS', weight: 35, levelBoost: 6 },
+        { label: '留下传承·给后来者希望', icon: '📜', rarity: 'S', weight: 25, levelBoost: 5 },
+        { label: '独自飞升·留下背影',     icon: '☁️', rarity: 'A', weight: 10, levelBoost: 3 },
+        { label: '拒绝飞升·留在大陆',     icon: '🏠', rarity: 'B', weight: 5, levelBoost: 2 },
+      ]
+    },
+  },
+  // ==================== 剧情后续补充 ====================
+  {
+    id: 'xiaoWu_reunion', title: '🐰 终得团聚', icon: '💕', minLevel: 55, maxLevel: 85, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['xiaoWu_guardian'],
+    prelude: '在你拼死守护之后，小舞终于和唐三团聚。唐三握着你的手："谢谢你。这份恩情，我唐三永世不忘。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '见证团聚·获得双人祝福！！', icon: '💕', rarity: 'SSS', weight: 25, levelBoost: 8, worldImpact: { tangSan: { affinity: 60 }, xiaoWu: { affinity: 60 } } },
+        { label: '默默退开·让他们独处',       icon: '🚶', rarity: 'SS', weight: 35, levelBoost: 5, worldImpact: { tangSan: { affinity: 30 }, xiaoWu: { affinity: 30 } } },
+        { label: '唐三传授海神之心',           icon: '🌊', rarity: 'S', weight: 25, levelBoost: 7, worldImpact: { tangSan: { affinity: 40 } } },
+        { label: '觉得他们太肉麻·先走了',     icon: '😅', rarity: 'B', weight: 15, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'dai_coronation', title: '👑 星罗加冕', icon: '🏰', minLevel: 60, maxLevel: 85, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['dai_throne'],
+    prelude: '戴沐白击败戴维斯，正式加冕星罗帝国皇帝！"没有你，就没有今天的我。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '成为荣誉亲王！！',   icon: '👑', rarity: 'SSS', weight: 18, levelBoost: 10, worldImpact: { daiMuBai: { affinity: 60 } } },
+        { label: '接受帝国勋章',       icon: '🎖️', rarity: 'SS', weight: 30, levelBoost: 6, worldImpact: { daiMuBai: { affinity: 40 } } },
+        { label: '婉拒·不想被束缚',   icon: '🙅', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '加冕遇刺·救下沐白', icon: '🛡️', rarity: 'SSS', weight: 12, levelBoost: 8, worldImpact: { daiMuBai: { affinity: 80 } } },
+        { label: '不参加·太远了',     icon: '😴', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+  {
+    id: 'oscar_mastery', title: '🌭 食物封神', icon: '🍖', minLevel: 55, maxLevel: 75, rarity: 'SS', isMilestone: true,
+    prelude: '奥斯卡激动地跑来："我成功了！我创造出能临时提升魂师等级的超级香肠！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '第一个试吃·效果惊人！！', icon: '🍖', rarity: 'SSS', weight: 18, levelBoost: 7, worldImpact: { oscar: { met: true, affinity: 40 } } },
+        { label: '帮他改良配方·效果更佳',   icon: '🧪', rarity: 'SS', weight: 28, levelBoost: 5, worldImpact: { oscar: { met: true, affinity: 30 } } },
+        { label: '鼓励他·信心大增',         icon: '💪', rarity: 'S', weight: 30, levelBoost: 3 },
+        { label: '不感兴趣·食物系是辅助',   icon: '🤷', rarity: 'B', weight: 24 },
+      ]
+    },
+  },
+  {
+    id: 'fatty_mastery', title: '🔥 邪火掌控', icon: '🐦', minLevel: 55, maxLevel: 78, rarity: 'SS', isMilestone: true,
+    prelude: '马红俊终于找到了控制邪火的方法！他的邪火凤凰武魂发生了质变！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '见证凤凰涅槃·获得感悟！！', icon: '🔥', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { maHongJun: { met: true, affinity: 40 } } },
+        { label: '帮他压制最后邪火·成功',     icon: '🧯', rarity: 'SS', weight: 28, levelBoost: 5, worldImpact: { maHongJun: { met: true, affinity: 30 } } },
+        { label: '获得邪火淬炼·魂力大增',     icon: '⚡', rarity: 'S', weight: 30, levelBoost: 6 },
+        { label: '邪火爆发·被波及受伤',       icon: '🤕', rarity: 'B', weight: 17, levelBoost: 3 },
+        { label: '不敢靠近·远远观望',         icon: '😰', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'zhu_redemption', title: '🐱 猫咪归心', icon: '💫', minLevel: 60, maxLevel: 82, rarity: 'SS', isMilestone: true,
+    prelude: '朱竹清卸下了暗杀者的身份，露出罕见的微笑。"谢谢你。如果不是你，我可能一辈子活在阴影里。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '帮她找到新的人生方向', icon: '🧭', rarity: 'SSS', weight: 18, levelBoost: 6, worldImpact: { zhuZhuQing: { met: true, affinity: 40 } } },
+        { label: '推荐她加入史莱克任教', icon: '🏫', rarity: 'SS', weight: 28, levelBoost: 4, worldImpact: { zhuZhuQing: { met: true, affinity: 25 } } },
+        { label: '让她跟随自己历练',     icon: '🤝', rarity: 'S', weight: 30, levelBoost: 5, worldImpact: { zhuZhuQing: { met: true, affinity: 30 } } },
+        { label: '不需要我的帮助',       icon: '😶', rarity: 'B', weight: 24, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'tang_farewell', title: '🌿 唐三告别', icon: '👋', minLevel: 65, maxLevel: 90, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['tang_oath'],
+    prelude: '唐三即将远行前往神界。"这一去，不知何时才能再见。保重。持此令牌，唐门永远是你的家。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '郑重收下·许下重逢之约！！', icon: '🤝', rarity: 'SSS', weight: 25, levelBoost: 8, worldImpact: { tangSan: { affinity: 50 } } },
+        { label: '唐三传授鬼影迷踪最终式',     icon: '💨', rarity: 'SS', weight: 30, levelBoost: 7, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '拥抱告别·泪流满面',         icon: '😢', rarity: 'S', weight: 25, levelBoost: 5, worldImpact: { tangSan: { affinity: 40 } } },
+        { label: '拒绝令牌·不想欠人情',       icon: '🙅', rarity: 'B', weight: 15, levelBoost: 2 },
+        { label: '不告而别·怕自己太难过',     icon: '💔', rarity: 'C', weight: 5 },
+      ]
+    },
+  },
+  // ==================== 章节关键剧情 ====================
+  {
+    id: 'chapter_climax_1', title: '⚡ 武魂觉醒·命运起点', icon: '✨', minLevel: 1, maxLevel: 20, rarity: 'SSS', isMilestone: true,
+    prelude: '武魂殿的觉醒水晶在你面前闪耀——改变你一生的瞬间。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '光芒万丈·震惊全场！！', icon: '✨', rarity: 'SSS', weight: 12, levelBoost: 6 },
+        { label: '顺利觉醒·迈出第一步',   icon: '💡', rarity: 'SS', weight: 28, levelBoost: 4 },
+        { label: '平凡觉醒·路还很长',     icon: '🔮', rarity: 'B', weight: 35, levelBoost: 2 },
+        { label: '觉醒受阻·激发潜能',     icon: '💪', rarity: 'A', weight: 25, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'chapter_climax_2', title: '⚡ 诺丁毕业·告别母校', icon: '🎓', minLevel: 20, maxLevel: 40, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['firstTeacher'],
+    prelude: '诺丁学院的钟声最后一次为你而鸣。转身踏上征程。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '最优成绩·全校欢送', icon: '🏅', rarity: 'SSS', weight: 15, levelBoost: 6 },
+        { label: '顺利毕业·老师赠言', icon: '📜', rarity: 'SS', weight: 30, levelBoost: 4 },
+        { label: '普通毕业·心怀梦想', icon: '🎒', rarity: 'B', weight: 35, levelBoost: 2 },
+        { label: '提前毕业·天赋异禀', icon: '⚡', rarity: 'S', weight: 20, levelBoost: 5 },
+      ]
+    },
+  },
+  {
+    id: 'chapter_climax_3', title: '⚡ 精英赛夺冠·名震大陆', icon: '🏆', minLevel: 40, maxLevel: 60, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_tournament_1'],
+    prelude: '武魂城中央大斗魂场的聚光灯——冠军奖杯就在眼前！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '举起奖杯·大陆震动！！', icon: '🏆', rarity: 'SSS', weight: 10, levelBoost: 12, worldImpact: { biBiDong: { met: true, affinity: 10 } } },
+        { label: '亚军·全场为你鼓掌',     icon: '🥈', rarity: 'SS', weight: 25, levelBoost: 8 },
+        { label: '季军·实力获认可',       icon: '🥉', rarity: 'S', weight: 30, levelBoost: 6 },
+        { label: '未夺冠·一战成名',       icon: '⚔️', rarity: 'A', weight: 25, levelBoost: 5 },
+        { label: '觉醒新力·虽败犹荣',     icon: '💫', rarity: 'SS', weight: 10, levelBoost: 10 },
+      ]
+    },
+  },
+  {
+    id: 'chapter_climax_4', title: '⚡ 大陆烽火·抉择时刻', icon: '⚔️', minLevel: 55, maxLevel: 80, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['huntStarted'],
+    prelude: '武魂帝国铁蹄踏遍大陆。求援信——"嘉陵关告急！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '率军驰援·成为联军统帅！！', icon: '⚔️', rarity: 'SSS', weight: 12, levelBoost: 10, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '亲自上阵·以一当百',         icon: '💪', rarity: 'SS', weight: 22, levelBoost: 8 },
+        { label: '制定战略·运筹帷幄',         icon: '🧠', rarity: 'S', weight: 28, levelBoost: 6 },
+        { label: '保护后方·保障补给',         icon: '🛡️', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '坐山观虎斗',                icon: '👀', rarity: 'C', weight: 13, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'chapter_climax_5', title: '⚡ 封神之路·最后试炼', icon: '🔱', minLevel: 85, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['godTrial'],
+    prelude: '神界之门打开——海神、修罗神、天使神三位主神虚影出现。"选择吧——"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '海神·大海守护者',   icon: '🌊', rarity: 'SSS', weight: 20, levelBoost: 10 },
+        { label: '修罗神·杀戮审判',   icon: '⚔️', rarity: 'SSS', weight: 18, levelBoost: 10 },
+        { label: '天使神·光明希望',   icon: '👼', rarity: 'SS', weight: 22, levelBoost: 8 },
+        { label: '拒绝·以凡躯比肩神', icon: '💪', rarity: 'SS', weight: 15, levelBoost: 12 },
+        { label: '自创神位·独一无二', icon: '💫', rarity: 'SSS', weight: 10, levelBoost: 15 },
+        { label: '犹豫·神界等待',     icon: '🤔', rarity: 'C', weight: 15, levelBoost: 5 },
+      ]
+    },
+  },
+  {
+    id: 'chapter_climax_6', title: '⚡ 封神加冕·传说永存', icon: '👑', minLevel: 95, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['chapter_climax_5'],
+    prelude: '百级成神！神界加冕大典——所有伙伴站在神界之门前为你送行。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接受加冕·成为新任主神！！', icon: '👑', rarity: 'SSS', weight: 25, levelBoost: 10 },
+        { label: '分享神位·与众神共治',       icon: '🤝', rarity: 'SS', weight: 30, levelBoost: 8 },
+        { label: '低调加冕·不喜张扬',         icon: '😌', rarity: 'S', weight: 25, levelBoost: 6 },
+        { label: '拒绝加冕·回到人间',         icon: '🏠', rarity: 'A', weight: 15, levelBoost: 4 },
+        { label: '加冕失败·但已成传说',       icon: '💔', rarity: 'C', weight: 5, levelBoost: 3 },
+      ]
+    },
+  },
+  // ==================== 唐门暗器锻造线 ====================
+  {
+    id: 'tang_forge_learn', title: '🔨 唐门锻造术', icon: '🛠️', minLevel: 22, maxLevel: 48, rarity: 'SS',
+    prelude: '唐三从怀中取出一把精巧的袖箭。"这是我唐门的暗器。如果你想学，我可以教你基础的锻造之法。"命运之轮，请转动——',
+    computeOptions(state) {
+      const isFriend = (state.relationships?.tangSan?.affinity || 0) >= 10
+      return [
+        { label: '拜师学艺·掌握唐门基础',   icon: '🎓', rarity: 'SSS', weight: isFriend ? 18 : 8, levelBoost: 4, worldImpact: { tangSan: { affinity: 25 } } },
+        { label: '虚心学习·打造第一件暗器', icon: '🔧', rarity: 'SS',  weight: 22, levelBoost: 3, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '觉得太难·但唐三耐心教导', icon: '😅', rarity: 'S',   weight: 28, levelBoost: 2, worldImpact: { tangSan: { affinity: 10 } } },
+        { label: '对锻造没兴趣·婉拒',       icon: '🙅', rarity: 'B',   weight: 20 },
+        { label: '想学但手笨·砸坏了材料',   icon: '💥', rarity: 'C',   weight: 12, worldImpact: { tangSan: { affinity: -5 } } },
+      ]
+    },
+  },
+  {
+    id: 'tang_forge_master', title: '⚡ 唐门秘传', icon: '📜', minLevel: 45, maxLevel: 65, rarity: 'SSS',
+    requiredEvents: ['tang_forge_learn'],
+    prelude: '唐三打开了唐门的玄天宝录——"这是我唐门先祖留下的暗器总纲。你是我唯一传授的外姓人。"命运之轮，请转动——',
+    computeOptions(state) {
+      const isClose = (state.relationships?.tangSan?.affinity || 0) >= 30
+      return [
+        { label: '掌握暴雨梨花针·唐门真传！！', icon: '🌸', rarity: 'SSS', weight: isClose ? 12 : 4, levelBoost: 8, worldImpact: { tangSan: { affinity: 40 } } },
+        { label: '学会孔雀翎·精巧暗器',         icon: '🦚', rarity: 'SS',  weight: 20, levelBoost: 5, worldImpact: { tangSan: { affinity: 20 } } },
+        { label: '只学到基础·但已受益匪浅',     icon: '📖', rarity: 'S',   weight: 30, levelBoost: 3, worldImpact: { tangSan: { affinity: 15 } } },
+        { label: '暗器太危险·选择放弃',         icon: '⚠️', rarity: 'A',   weight: 22, levelBoost: 1 },
+        { label: '走火入魔·唐三救了你',         icon: '🆘', rarity: 'C',   weight: 16, worldImpact: { tangSan: { affinity: 10 } } },
+      ]
+    },
+  },
+
+  // ==================== 武器获取事件（10件，Lv.10-100） ====================
+  {
+    id: 'weapon_iron', title: '⚔️ 精铁长剑', icon: '🗡️', minLevel: 10, maxLevel: 25, rarity: 'B',
+    prelude: '铁匠铺老师傅递给你一把精铁长剑——"虽不是神兵，但比空手强。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得精铁长剑·+30', icon: '🗡️', rarity: 'A', weight: 35, levelBoost: 2, weapon: { name: '精铁长剑', power: 30, rarity: 'B', source: '铁匠铺' } },
+        { label: '自己改良·+40',     icon: '🔨', rarity: 'S', weight: 20, levelBoost: 3, weapon: { name: '改良铁剑', power: 40, rarity: 'A', source: '自制' } },
+        { label: '普通铁剑·+15',     icon: '⚔️', rarity: 'B', weight: 30, levelBoost: 1, weapon: { name: '铁剑', power: 15, rarity: 'C', source: '铁匠铺' } },
+        { label: '婉拒',             icon: '🙅', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_shadow', title: '🏹 含沙射影', icon: '🌑', minLevel: 12, maxLevel: 28, rarity: 'A',
+    prelude: '神秘商贩兜售精巧暗器——含沙射影，瞬间发射数十枚毒针。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '购得真品·+45',   icon: '🌑', rarity: 'SS', weight: 18, levelBoost: 3, weapon: { name: '含沙射影', power: 45, rarity: 'A', source: '神秘商贩' } },
+        { label: '买下仿品·+30',   icon: '🏹', rarity: 'A', weight: 30, levelBoost: 2, weapon: { name: '含沙射影(仿)', power: 30, rarity: 'B', source: '市集' } },
+        { label: '太贵·放弃',     icon: '💰', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '识破骗局',       icon: '👁️', rarity: 'C', weight: 22 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_peacock', title: '🦚 孔雀翎', icon: '💫', minLevel: 30, maxLevel: 50, rarity: 'SS',
+    requiredEvents: ['interact_tangSanNight'],
+    prelude: '唐三从唐门密匣取出孔雀翎——"外门暗器排名第三。十二枚翎羽同时射出。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得孔雀翎·+70',   icon: '🦚', rarity: 'SSS', weight: 15, levelBoost: 5, weapon: { name: '孔雀翎', power: 70, rarity: 'SS', source: '唐三' } },
+        { label: '学会装配·+60',     icon: '🔧', rarity: 'SS', weight: 28, levelBoost: 3, weapon: { name: '孔雀翎(熟悉)', power: 60, rarity: 'S', source: '唐三' } },
+        { label: '备用翎羽·+45',     icon: '🪶', rarity: 'A', weight: 30, levelBoost: 2, weapon: { name: '孔雀翎羽', power: 45, rarity: 'A', source: '唐三' } },
+        { label: '太贵重·婉拒',     icon: '🙏', rarity: 'B', weight: 27, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_crossbow', title: '🏹 诸葛神弩', icon: '🎯', minLevel: 35, maxLevel: 58, rarity: 'SS',
+    requiredEvents: ['weapon_peacock'],
+    prelude: '唐三又带来诸葛神弩——"四十八支弩箭，魂王以下一发毙命。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得诸葛神弩·+90',   icon: '🎯', rarity: 'SSS', weight: 15, levelBoost: 6, weapon: { name: '诸葛神弩', power: 90, rarity: 'SS', source: '唐三' } },
+        { label: '学会装填·+75',       icon: '🔧', rarity: 'SS', weight: 28, levelBoost: 4, weapon: { name: '诸葛神弩(熟练)', power: 75, rarity: 'S', source: '唐三' } },
+        { label: '获得图纸·+55',       icon: '📜', rarity: 'S', weight: 30, levelBoost: 3, weapon: { name: '自制诸葛弩', power: 55, rarity: 'A', source: '自制' } },
+        { label: '暗器非正道·婉拒',   icon: '🙅', rarity: 'B', weight: 27, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_rain', title: '☔ 暴雨梨花针', icon: '🌸', minLevel: 50, maxLevel: 70, rarity: 'SSS',
+    requiredEvents: ['weapon_crossbow'],
+    prelude: '唐三神色凝重地取出暴雨梨花针——"唐门排名第二。二百七十三枚梨花针，封号斗罗以下无可闪避。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得暴雨梨花针·+120',   icon: '🌸', rarity: 'SSS', weight: 12, levelBoost: 8, weapon: { name: '暴雨梨花针', power: 120, rarity: 'SSS', source: '唐三' } },
+        { label: '获得简化版·+85',         icon: '🌧️', rarity: 'SS', weight: 25, levelBoost: 5, weapon: { name: '暴雨针(简)', power: 85, rarity: 'S', source: '唐三' } },
+        { label: '学习制造·+100',          icon: '📖', rarity: 'S', weight: 30, levelBoost: 6, weapon: { name: '梨花针套装', power: 100, rarity: 'SS', source: '唐三' } },
+        { label: '太危险·放弃',           icon: '😰', rarity: 'C', weight: 33, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_spear', title: '🔱 破魂枪', icon: '🗡️', minLevel: 55, maxLevel: 75, rarity: 'SS',
+    prelude: '破之一族族长杨无敌找到你——"破魂枪，专破武魂防御。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得破魂枪·+130',   icon: '🔱', rarity: 'SSS', weight: 12, levelBoost: 7, weapon: { name: '破魂枪', power: 130, rarity: 'SS', source: '杨无敌' } },
+        { label: '学会枪法·+110',     icon: '⚔️', rarity: 'SS', weight: 25, levelBoost: 6, weapon: { name: '破魂枪(精通)', power: 110, rarity: 'S', source: '杨无敌' } },
+        { label: '暂借·+80',         icon: '📋', rarity: 'A', weight: 30, levelBoost: 4, weapon: { name: '破魂枪(借用)', power: 80, rarity: 'A', source: '杨无敌' } },
+        { label: '不适合·婉拒',       icon: '🙅', rarity: 'B', weight: 33, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_guide', title: '💎 魂导器', icon: '🔮', minLevel: 60, maxLevel: 80, rarity: 'SS',
+    prelude: '魂导器大师看中你的天赋——"这件魂导器可以增幅你的魂力输出。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得魂导器·+160',   icon: '🔮', rarity: 'SSS', weight: 12, levelBoost: 6, weapon: { name: '魂导增幅器', power: 160, rarity: 'SS', source: '魂导大师' } },
+        { label: '学习魂导技术·+130', icon: '📖', rarity: 'SS', weight: 22, levelBoost: 5, weapon: { name: '自制魂导器', power: 130, rarity: 'S', source: '自制' } },
+        { label: '魂导护盾·+100',     icon: '🛡️', rarity: 'S', weight: 30, levelBoost: 4, weapon: { name: '魂导护盾', power: 100, rarity: 'A', source: '魂导大师' } },
+        { label: '太复杂·放弃',       icon: '😵', rarity: 'C', weight: 36, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_lotus', title: '🪷 佛怒唐莲', icon: '🌸', minLevel: 75, maxLevel: 95, rarity: 'SSS',
+    requiredEvents: ['weapon_rain'],
+    prelude: '唐三打开唐门最核心的密匣——佛怒唐莲！"唐门排名第一。绽放时如佛莲盛开，方圆百丈寸草不生。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得佛怒唐莲·+250',   icon: '🪷', rarity: 'SSS', weight: 8, levelBoost: 10, weapon: { name: '佛怒唐莲', power: 250, rarity: 'SSS', source: '唐三' } },
+        { label: '仿制品·+180',         icon: '🌺', rarity: 'SS', weight: 22, levelBoost: 7, weapon: { name: '佛怒唐莲(仿)', power: 180, rarity: 'SS', source: '唐三' } },
+        { label: '暗器总纲·+200',       icon: '📖', rarity: 'S', weight: 30, levelBoost: 8, weapon: { name: '唐门暗器总纲', power: 200, rarity: 'SS', source: '唐门传承' } },
+        { label: '太危险·拒绝',         icon: '😰', rarity: 'C', weight: 40, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_trident', title: '🔱 海神三叉戟', icon: '🌊', minLevel: 70, maxLevel: 100, rarity: 'SSS',
+    requiredEvents: ['arc_seagod_8'],
+    prelude: '海神三叉戟认可了你——十万八千斤的神器在你手中轻如鸿毛！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '掌控三叉戟·+500', icon: '🔱', rarity: 'SSS', weight: 10, levelBoost: 10, weapon: { name: '海神三叉戟', power: 500, rarity: 'SSS', source: '海神' } },
+        { label: '融合印记·+350',   icon: '💙', rarity: 'SS', weight: 28, levelBoost: 8, weapon: { name: '海神三叉戟(觉醒中)', power: 350, rarity: 'SS', source: '海神' } },
+        { label: '虚影·+200',       icon: '🔱', rarity: 'S', weight: 35, levelBoost: 6, weapon: { name: '三叉戟虚影', power: 200, rarity: 'S', source: '海神' } },
+        { label: '太重·无法使用',   icon: '😔', rarity: 'C', weight: 27, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_dragonboat', title: '⛵ 龙渊艇', icon: '🚤', minLevel: 55, maxLevel: 80, rarity: 'SS',
+    prelude: '唐门密库中发现一件奇特魂导器——龙渊艇！可潜水航行的神器。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得龙渊艇·战力+120', icon: '⛵', rarity: 'SSS', weight: 15, levelBoost: 5, weapon: { name: '龙渊艇', power: 120, rarity: 'SS', source: '唐门密库' } },
+        { label: '学会驾驶技巧',         icon: '🧭', rarity: 'SS', weight: 25, levelBoost: 4, weapon: { name: '龙渊艇(熟练)', power: 100, rarity: 'S', source: '自学' } },
+        { label: '太复杂·放弃',         icon: '😵', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '转送给唐三·获得人情', icon: '🎁', rarity: 'A', weight: 30, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_angel', title: '👼 天使圣剑', icon: '🗡️', minLevel: 65, maxLevel: 90, rarity: 'SSS',
+    requiredEvents: ['arc_angel_6'],
+    prelude: '天使神殿中一把圣剑悬浮在空中——天使圣剑！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得天使圣剑·+180', icon: '👼', rarity: 'SSS', weight: 12, levelBoost: 8, weapon: { name: '天使圣剑', power: 180, rarity: 'SSS', source: '天使神' } },
+        { label: '获得天使之刃·+140', icon: '✨', rarity: 'SS', weight: 25, levelBoost: 6, weapon: { name: '天使之刃', power: 140, rarity: 'SS', source: '天使神' } },
+        { label: '获得祝福之剑·+100', icon: '⚔️', rarity: 'S', weight: 30, levelBoost: 5, weapon: { name: '祝福之剑', power: 100, rarity: 'S', source: '天使神' } },
+        { label: '圣剑不认可·被拒绝', icon: '😔', rarity: 'C', weight: 33, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_death', title: '💀 死神镰刀', icon: '🪝', minLevel: 70, maxLevel: 95, rarity: 'SSS',
+    prelude: '死亡领域深处浮现一把漆黑镰刀——死神镰刀！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '掌控死神镰刀·+200', icon: '💀', rarity: 'SSS', weight: 10, levelBoost: 8, weapon: { name: '死神镰刀', power: 200, rarity: 'SSS', source: '死亡领域' } },
+        { label: '部分掌控·+150',     icon: '🪝', rarity: 'SS', weight: 22, levelBoost: 6, weapon: { name: '死神镰刀(部分)', power: 150, rarity: 'SS', source: '死亡领域' } },
+        { label: '被镰刀反噬·受伤',   icon: '🤕', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '拒绝·太危险',       icon: '🚫', rarity: 'C', weight: 38, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_icefire', title: '❄️ 冰火双剑', icon: '🔥', minLevel: 60, maxLevel: 85, rarity: 'SS',
+    requiredEvents: ['iceFireWell'],
+    prelude: '冰火两仪眼中凝聚出两把剑——一把烈焰灼天，一把寒冰封海。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得冰火双剑·+160', icon: '🔥', rarity: 'SSS', weight: 12, levelBoost: 7, weapon: { name: '冰火双剑', power: 160, rarity: 'SS', source: '冰火两仪眼' } },
+        { label: '火剑·+100',         icon: '🔥', rarity: 'SS', weight: 22, levelBoost: 5, weapon: { name: '烈焰剑', power: 100, rarity: 'S', source: '冰火两仪眼' } },
+        { label: '冰剑·+100',         icon: '❄️', rarity: 'SS', weight: 22, levelBoost: 5, weapon: { name: '寒冰剑', power: 100, rarity: 'S', source: '冰火两仪眼' } },
+        { label: '无法收服·剑消失了', icon: '💨', rarity: 'C', weight: 44, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_umbrella', title: '☂️ 天机伞', icon: '🌂', minLevel: 50, maxLevel: 75, rarity: 'A',
+    prelude: '一位机关大师展示他的杰作——天机伞！攻防一体的机关武器。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得天机伞·+90', icon: '☂️', rarity: 'SS', weight: 18, levelBoost: 4, weapon: { name: '天机伞', power: 90, rarity: 'A', source: '机关大师' } },
+        { label: '学会机关术·+70', icon: '🔧', rarity: 'S', weight: 22, levelBoost: 3, weapon: { name: '天机伞(熟悉)', power: 70, rarity: 'A', source: '自学' } },
+        { label: '太贵·放弃',     icon: '💰', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '看不上·离开',   icon: '😒', rarity: 'C', weight: 30, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_abyss', title: '👁️ 深渊之眼', icon: '🔮', minLevel: 75, maxLevel: 100, rarity: 'SSS',
+    prelude: '神界裂缝中掉落一颗深渊之眼——它能看破一切虚妄！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '融合深渊之眼·+220', icon: '👁️', rarity: 'SSS', weight: 8, levelBoost: 9, weapon: { name: '深渊之眼', power: 220, rarity: 'SSS', source: '神界裂缝' } },
+        { label: '部分融合·+170',     icon: '🔮', rarity: 'SS', weight: 20, levelBoost: 7, weapon: { name: '深渊之眼(部分)', power: 170, rarity: 'SS', source: '神界裂缝' } },
+        { label: '反噬·获得洞察力',   icon: '💡', rarity: 'S', weight: 30, levelBoost: 5, weapon: { name: '洞察之眼', power: 120, rarity: 'S', source: '神界裂缝' } },
+        { label: '太大风险·放弃',     icon: '😰', rarity: 'C', weight: 42, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_godSlayer', title: '⚔️ 弑神之刃', icon: '🗡️', minLevel: 85, maxLevel: 100, rarity: 'SSS',
+    requiredEvents: ['canon_godWar'],
+    prelude: '双神之战后残留下来的弑神之刃——它曾刺穿过神明的躯体！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '收服弑神之刃·+300', icon: '🗡️', rarity: 'SSS', weight: 6, levelBoost: 12, weapon: { name: '弑神之刃', power: 300, rarity: 'SSS', source: '双神之战' } },
+        { label: '碎片重铸·+200',     icon: '🔨', rarity: 'SS', weight: 18, levelBoost: 8, weapon: { name: '弑神碎片', power: 200, rarity: 'SS', source: '双神之战' } },
+        { label: '力量太强·放弃',     icon: '😰', rarity: 'A', weight: 35, levelBoost: 3 },
+        { label: '被刃反噬·重伤',     icon: '🤕', rarity: 'C', weight: 41, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'weapon_fate', title: '📜 命运之书', icon: '📖', minLevel: 95, maxLevel: 100, rarity: 'SSS',
+    prelude: '神界图书馆的守护者递给你一本金色书籍——命运之书！记录了整个斗罗大陆的命运。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '获得命运之书·+350', icon: '📖', rarity: 'SSS', weight: 5, levelBoost: 10, weapon: { name: '命运之书', power: 350, rarity: 'SSS', source: '神界图书馆' } },
+        { label: '抄录副本·+250',     icon: '📝', rarity: 'SS', weight: 15, levelBoost: 8, weapon: { name: '命运之书(副本)', power: 250, rarity: 'SS', source: '神界图书馆' } },
+        { label: '无法读懂·放弃',     icon: '😵', rarity: 'B', weight: 35, levelBoost: 3 },
+        { label: '太沉重·承受不了',   icon: '😰', rarity: 'C', weight: 45, levelBoost: 2 },
+      ]
+    },
+  },
+
+  // ==================== 神器获得剧情 ====================
+  {
+    id: 'artifact_asuraSword', title: '⚔️ 修罗神剑', icon: '🗡️', minLevel: 90, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['canon_asuraGod'],
+    prelude: '修罗神殿的最深处，一柄通体血红的巨剑悬浮在空中——修罗神剑！剑身上的符文如同活物般蠕动。"握起它，你将继承修罗神的杀伐之力。"命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || state.level * 10
+      return [
+        { label: '拔出修罗神剑·杀神降临！！',   icon: '⚔️', rarity: 'SSS', weight: power >= 50000 ? 15 : 4, levelBoost: 15, weapon: { name: '修罗神剑', power: 400, rarity: 'SSS', source: '修罗神' } },
+        { label: '剑身共鸣·获得修罗剑意',       icon: '💀', rarity: 'SS',  weight: 22, levelBoost: 10, weapon: { name: '修罗剑意', power: 250, rarity: 'SS', source: '修罗神' } },
+        { label: '无法拔出·但获得了修罗印记',   icon: '🩸', rarity: 'S',   weight: 30, levelBoost: 6 },
+        { label: '被剑意反噬·重伤倒地',         icon: '💔', rarity: 'B',   weight: 28, levelBoost: 3 },
+        { label: '修罗神收回神剑·时机未到',     icon: '⏳', rarity: 'C',   weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'artifact_angelSword', title: '👼 天使圣剑', icon: '✨', minLevel: 85, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    prelude: '天使神殿的天花板轰然裂开，一柄燃烧着圣焰的长剑从天而降——天使圣剑！千仞雪的声音回荡："只有真正信仰光明之人，才能驾驭它。"命运之轮，请转动——',
+    computeOptions(state) {
+      const metQian = state.relationships?.qianRenXue?.met
+      return [
+        { label: '接受圣焰洗礼·执掌天使圣剑！！', icon: '🔥', rarity: 'SSS', weight: metQian ? 12 : 4, levelBoost: 12, weapon: { name: '天使圣剑', power: 350, rarity: 'SSS', source: '天使神' } },
+        { label: '圣剑共鸣·获得天使祝福',         icon: '👼', rarity: 'SS',  weight: 22, levelBoost: 8, weapon: { name: '天使祝福', power: 200, rarity: 'SS', source: '天使神' } },
+        { label: '圣焰太强·无法承受',             icon: '😰', rarity: 'S',   weight: 28, levelBoost: 4 },
+        { label: '被千仞雪取走·她说你未准备好',   icon: '😔', rarity: 'A',   weight: 25, levelBoost: 2, worldImpact: { qianRenXue: { affinity: 10 } } },
+        { label: '圣剑灼伤·被迫退开',             icon: '🔥', rarity: 'C',   weight: 21, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'artifact_haotianWeapon', title: '🔨 大须弥锤·真器', icon: '💥', minLevel: 75, maxLevel: 95, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['tangHao_appear'],
+    prelude: '唐昊伸出手，一柄比昊天锤更加巨大的黑色巨锤从虚空中浮现——"这才是昊天宗真正的镇宗之宝——大须弥锤！不是魂技，是真正的神器！"命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || state.level * 10
+      return [
+        { label: '举起大须弥锤·唐昊认可！！',     icon: '🔨', rarity: 'SSS', weight: power >= 30000 ? 12 : 3, levelBoost: 12, weapon: { name: '大须弥锤', power: 380, rarity: 'SSS', source: '唐昊' } },
+        { label: '勉强举起·唐昊微微点头',         icon: '💪', rarity: 'SS',  weight: 20, levelBoost: 8, weapon: { name: '大须弥锤(认主)', power: 250, rarity: 'SS', source: '唐昊' } },
+        { label: '举不动·但唐昊传授锤法',         icon: '📖', rarity: 'S',   weight: 28, levelBoost: 6 },
+        { label: '被锤压垮·众人哄笑',             icon: '😅', rarity: 'B',   weight: 25, levelBoost: 2 },
+        { label: '唐昊收回·说你还不够格',         icon: '😔', rarity: 'C',   weight: 24, levelBoost: 1, worldImpact: { tangHao: { affinity: -10 } } },
+      ]
+    },
+  },
+  {
+    id: 'artifact_tridentMaster', title: '🔱 三叉戟·海神真传', icon: '🌊', minLevel: 88, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['canon_seaGodTrident'],
+    prelude: '你已拔出海神三叉戟，但波塞冬的虚影再次浮现——"拔出只是开始。真正的海神之力，需要你将三叉戟炼化为本命神器。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '炼化三叉戟·海洋之力加身！！', icon: '🔱', rarity: 'SSS', weight: 10, levelBoost: 15, weapon: { name: '海神三叉戟(觉醒)', power: 450, rarity: 'SSS', source: '海神' } },
+        { label: '三叉戟认主·实力大进',         icon: '💙', rarity: 'SS',  weight: 22, levelBoost: 10, weapon: { name: '海神三叉戟(认主)', power: 300, rarity: 'SS', source: '海神' } },
+        { label: '只能发挥部分力量',             icon: '🌊', rarity: 'S',   weight: 28, levelBoost: 6 },
+        { label: '炼化失败·但不影响使用',       icon: '😔', rarity: 'A',   weight: 25, levelBoost: 3 },
+        { label: '被波塞冬收回·考核失败',       icon: '😵', rarity: 'C',   weight: 15 },
+      ]
+    },
+  },
+
+  // ==================== 多样化生活事件 ====================
+  {
+    id: 'event_sparring', title: '🤼 切磋交流', icon: '🥋', minLevel: 15, maxLevel: 100, rarity: 'B',
+    prelude: '一位同级学员邀请你切磋——友好较量，互相学习。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '认真对待·双方提升', icon: '🤝', rarity: 'SS', weight: 20, levelBoost: 3 },
+        { label: '轻松切磋·点到为止', icon: '👊', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '指导对方·获得感激', icon: '👨‍🏫', rarity: 'S', weight: 15, levelBoost: 2 },
+        { label: '不小心打伤对方',     icon: '🤕', rarity: 'C', weight: 20, levelBoost: 1 },
+        { label: '被对方打败·吸取教训', icon: '📖', rarity: 'C', weight: 15, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'event_meditation', title: '🧘 深夜冥想', icon: '🌙', minLevel: 10, maxLevel: 100, rarity: 'B',
+    prelude: '深夜月光洒在窗前。你盘膝进入深度冥想——命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '顿悟！魂力突破瓶颈', icon: '💡', rarity: 'SSS', weight: 10, levelBoost: 5 },
+        { label: '冥想顺利·魂力稳固', icon: '🧘', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '浅层冥想·略有收获', icon: '😌', rarity: 'B', weight: 35, levelBoost: 1 },
+        { label: '心绪不宁·无法入定', icon: '😰', rarity: 'C', weight: 25 },
+      ]
+    },
+  },
+  {
+    id: 'event_rain', title: '🌧️ 雨中偶遇', icon: '☂️', minLevel: 12, maxLevel: 100, rarity: 'A',
+    prelude: '暴雨突降，你在屋檐下避雨。身边站着一个同样被困的陌生人……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '攀谈起来·交换修炼心得', icon: '💬', rarity: 'SS', weight: 20, levelBoost: 3 },
+        { label: '分享干粮·收获友谊',     icon: '🍞', rarity: 'S', weight: 18, levelBoost: 2 },
+        { label: '借给对方伞·自己淋雨',   icon: '☂️', rarity: 'SSS', weight: 12, levelBoost: 2 },
+        { label: '保持沉默·等待雨停',     icon: '😶', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '抱怨天气·对方走开了',   icon: '😤', rarity: 'C', weight: 20 },
+      ]
+    },
+  },
+  {
+    id: 'event_blacksmith', title: '⚒️ 铁匠铺', icon: '🔨', minLevel: 20, maxLevel: 100, rarity: 'B',
+    prelude: '老铁匠看到你后停了手中的活——"年轻人，想定制一把趁手的武器吗？"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '参与锻造·学会基础锻造术', icon: '🔨', rarity: 'SS', weight: 15, levelBoost: 3 },
+        { label: '定制武器·花费不小但值得', icon: '⚔️', rarity: 'S', weight: 20, levelBoost: 4 },
+        { label: '帮忙打铁·获得报酬',       icon: '💪', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '婉拒·已有好武器了',       icon: '🙅', rarity: 'B', weight: 25, levelBoost: 1 },
+        { label: '不小心弄坏半成品',         icon: '💥', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'event_tavern', title: '🍺 酒馆传说', icon: '🏮', minLevel: 22, maxLevel: 100, rarity: 'A',
+    prelude: '老佣兵正讲述星斗大森林深处的秘境传说。所有人都听入迷了。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '请老佣兵喝酒·获得详细情报', icon: '🍻', rarity: 'SS', weight: 18, levelBoost: 3 },
+        { label: '记住关键信息·准备探索',     icon: '🧠', rarity: 'S', weight: 25, levelBoost: 2 },
+        { label: '当成故事·不以为意',         icon: '🤷', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '质疑老人·被赶出酒馆',       icon: '😤', rarity: 'C', weight: 15 },
+        { label: '发现是武魂殿眼线在套话',     icon: '👁️', rarity: 'S', weight: 12, levelBoost: 3, worldImpact: { biBiDong: { met: true, affinity: -5 } } },
+      ]
+    },
+  },
+  {
+    id: 'event_herbs', title: '🌿 药草采集', icon: '🌱', minLevel: 18, maxLevel: 100, rarity: 'B',
+    prelude: '森林中发现一片稀有药草区域。采集可炼丹或直接服用提升魂力。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '找到珍品药草·魂力大增', icon: '💎', rarity: 'SSS', weight: 8, levelBoost: 5 },
+        { label: '采集到不错的一批',       icon: '🌿', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '收获尚可·够自己用了',   icon: '✅', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '大部分已经枯萎了',       icon: '🥀', rarity: 'C', weight: 22, levelBoost: 1 },
+        { label: '遇到守护魂兽·放弃采集', icon: '🐍', rarity: 'C', weight: 12 },
+      ]
+    },
+  },
+  {
+    id: 'event_campfire', title: '🔥 篝火夜话', icon: '🏕️', minLevel: 25, maxLevel: 100, rarity: 'A',
+    prelude: '夜色篝火旁，旅伴围坐。有人开始讲起了故乡……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '分享自己的故事·拉近距离', icon: '💬', rarity: 'SS', weight: 20, levelBoost: 3, worldImpact: { tangSan: { met: true, affinity: 10 }, xiaoWu: { met: true, affinity: 10 } } },
+        { label: '静静倾听·学到了很多',     icon: '👂', rarity: 'S', weight: 25, levelBoost: 2 },
+        { label: '被要求表演·尴尬但有趣',   icon: '🎭', rarity: 'A', weight: 25, levelBoost: 1 },
+        { label: '早早睡了·太累了',         icon: '😴', rarity: 'B', weight: 20 },
+        { label: '守夜·发现异常动静',       icon: '👀', rarity: 'S', weight: 10, levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'event_moral', title: '⚖️ 道德抉择', icon: '💭', minLevel: 30, maxLevel: 100, rarity: 'S',
+    prelude: '贵族护卫在欺负平民——他是武魂殿盟友，得罪他可能招来麻烦。但平民已被打倒在地……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '挺身而出·教训护卫',   icon: '🛡️', rarity: 'SSS', weight: 15, levelBoost: 5, worldImpact: { biBiDong: { affinity: -15 } } },
+        { label: '巧妙调解·不伤和气',   icon: '🧠', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '暗中帮助平民治伤·匿名', icon: '🩹', rarity: 'S', weight: 25, levelBoost: 3 },
+        { label: '当作没看见·不惹麻烦',   icon: '🚶', rarity: 'B', weight: 23, levelBoost: 1 },
+        { label: '加入欺负者·展示力量',   icon: '😈', rarity: 'C', weight: 15, levelBoost: 2 },
+      ]
+    },
+  },
+  // ==================== 剧情链：事件后续 ====================
+  {
+    id: 'chain_tavern_explore', title: '🗺️ 秘境探索', icon: '🏞️', minLevel: 28, maxLevel: 65, rarity: 'SS',
+    requiredEvents: ['event_tavern'],
+    prelude: '酒馆老佣兵的情报是真的！星斗大森林深处果然有一处前人留下的秘境。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '深入秘境·发现远古传承！！', icon: '💎', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '小心探索·收获颇丰',         icon: '🗺️', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '遇到机关·化险为夷',         icon: '⚠️', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '秘境崩塌·匆忙逃离但有收获', icon: '💨', rarity: 'A', weight: 25, levelBoost: 3 },
+        { label: '情报有误·空欢喜一场',       icon: '😤', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'chain_blacksmith_master', title: '⚒️ 锻造大师', icon: '🔨', minLevel: 30, maxLevel: 62, rarity: 'SS',
+    requiredEvents: ['event_blacksmith'],
+    prelude: '老铁匠被你的锻造天赋打动——"魂力锻造不同于普通锻造，需要将武魂力量融入武器之中。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '掌握魂力锻造·铸造魂导器！！', icon: '⚡', rarity: 'SSS', weight: 12, levelBoost: 7 },
+        { label: '成功锻造专属武器',           icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '学到高级淬火技巧',           icon: '🔥', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '太难了·只学会基础',         icon: '😓', rarity: 'B', weight: 23, levelBoost: 2 },
+        { label: '炸炉了·被赶出去',           icon: '💥', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'chain_moral_revenge', title: '⚖️ 贵族的报复', icon: '🏛️', minLevel: 38, maxLevel: 75, rarity: 'SS',
+    requiredEvents: ['event_moral'],
+    prelude: '那个被你教训的贵族派人查出你的身份。护卫队长堵住你去路——"上次多管闲事，今天付出代价。"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败护卫·贵族落荒而逃', icon: '⚔️', rarity: 'SSS', weight: 18, levelBoost: 6 },
+        { label: '法律手段·让他付出代价', icon: '📜', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '和解·贵族道歉赔偿',     icon: '🤝', rarity: 'S', weight: 25, levelBoost: 3 },
+        { label: '避免冲突·暂避锋芒',     icon: '🚶', rarity: 'A', weight: 20, levelBoost: 2 },
+        { label: '被暗算·平民来帮忙',     icon: '🩹', rarity: 'B', weight: 15, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 400)
+    },
+  },
+  {
+    id: 'chain_herbs_alchemy', title: '🧪 炼丹尝试', icon: '💊', minLevel: 25, maxLevel: 55, rarity: 'S',
+    requiredEvents: ['event_herbs'],
+    prelude: '炼丹师看着你的药草啧啧称奇——"品质不错！如果你愿意，我可以教你基础丹药炼制。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '成功炼出魂力丹·魂力大增！！', icon: '💊', rarity: 'SSS', weight: 12, levelBoost: 6 },
+        { label: '炼出几枚不错的丹药',         icon: '🧪', rarity: 'SS', weight: 25, levelBoost: 4 },
+        { label: '学到炼丹基础·日后可自学',   icon: '📖', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '炸炉了·但没受伤',           icon: '💥', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '浪费药草·炼丹师摇头',       icon: '🥀', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'chain_sparring_tournament', title: '🏟️ 友谊赛邀请', icon: '🥋', minLevel: 28, maxLevel: 50, rarity: 'A',
+    requiredEvents: ['event_sparring'],
+    prelude: '上次切磋的学员如今已是学院首席——"你是我遇到过最好的对手，让我们再比一次！"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '全力以赴·精彩对决', icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 4 },
+        { label: '以智取胜·看破招式', icon: '🧠', rarity: 'S', weight: 25, levelBoost: 3 },
+        { label: '平局·惺惺相惜',     icon: '🤝', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '惜败·但收获友谊',   icon: '😊', rarity: 'B', weight: 15, levelBoost: 2 },
+        { label: '被完虐·差距太大',   icon: '😵', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'chain_rain_friend', title: '☀️ 雨后重逢', icon: '🌈', minLevel: 20, maxLevel: 50, rarity: 'A',
+    requiredEvents: ['event_rain'],
+    prelude: '雨天遇到的陌生人竟然是学院的交换生！"是你！那个雨天……我一直想谢谢你。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '成为好朋友·互帮互助', icon: '💕', rarity: 'SSS', weight: 18, levelBoost: 4, worldImpact: { tangSan: { met: true, affinity: 15 } } },
+        { label: '一起修炼·互相促进',   icon: '🏋️', rarity: 'SS', weight: 28, levelBoost: 3 },
+        { label: '简单叙旧·保持联系',   icon: '📝', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '已经忘了对方是谁',     icon: '😶', rarity: 'C', weight: 24, levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'chain_campfire_dawn', title: '🌄 破晓哨声', icon: '🔔', minLevel: 32, maxLevel: 68, rarity: 'S',
+    requiredEvents: ['event_campfire'],
+    prelude: '守夜时发现的异常动静果然不是错觉——一支来路不明的人马正靠近营地！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '主动出击·击退来犯者', icon: '⚔️', rarity: 'SSS', weight: 18, levelBoost: 6 },
+        { label: '智取·设陷阱捕获他们', icon: '🧠', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '叫醒同伴·共同应对',   icon: '👥', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '静观其变·只是路过',   icon: '👀', rarity: 'B', weight: 20, levelBoost: 2 },
+        { label: '被偷袭惨败·营地混乱',     icon: '😱', rarity: 'C', weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 350)
+    },
+  },
+  {
+    id: 'chain_meditation_vision', title: '👁️ 武魂幻境', icon: '🌀', minLevel: 25, maxLevel: 55, rarity: 'SS',
+    requiredEvents: ['event_meditation'],
+    prelude: '冥想中意识被拉入奇异空间——那是你武魂最深处的幻境！古老的声音在低语……命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '与武魂沟通·觉醒隐藏力量！！', icon: '🌀', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '理解武魂真意·悟出新魂技',     icon: '💡', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '接受武魂指引·方向更清晰',     icon: '🧭', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '幻境消散·留下启示',           icon: '🌫️', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '被武魂反噬·精神受创',         icon: '😵', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  // ==================== 修罗九考 ====================
+  {
+    id: 'arc_asura_1', title: '⚔️ 修罗第一考·杀戮之心', icon: '💀', minLevel: 50, maxLevel: 100, rarity: 'SS', isMilestone: true,
+    prelude: '血色光柱笼罩你——修罗神试炼！第一考：战胜心中杀意。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '战胜心魔·修罗印记！！', icon: '💀', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 6 },
+        { label: '保持理智·通过考验',     icon: '🧘', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 4 },
+        { label: '差点失控·勉强通过',     icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '失败·被杀欲吞噬',       icon: '😵', rarity: 'C', weight: Math.max(5, 27 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_2', title: '⚔️ 修罗第二考·审判天平', icon: '⚖️', minLevel: 52, maxLevel: 100, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_asura_1'],
+    prelude: '第二考：审判天平。命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2000)
+      return [
+        { label: '天平平衡·修罗认可！！', icon: '⚖️', rarity: 'SSS', weight: Math.floor(15 * pwr), levelBoost: 5 },
+        { label: '善端微重·通过考验',     icon: '✨', rarity: 'SS', weight: Math.floor(28 * pwr), levelBoost: 4 },
+        { label: '恶端稍重·修罗欣赏',     icon: '💀', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '审判失败·被逐出',       icon: '🚫', rarity: 'C', weight: Math.max(5, 27 - Math.floor(10 * pwr)), levelBoost: 1 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_3', title: '⚔️ 修罗第三考·血誓', icon: '🩸', minLevel: 54, maxLevel: 100, rarity: 'SS', isMilestone: true,
+    requiredEvents: ['arc_asura_2'],
+    prelude: '第三考：用鲜血刻下修罗血誓！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2200)
+      return [
+        { label: '血誓成立·修罗之力！！', icon: '🩸', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 6 },
+        { label: '誓言被接受·通过',       icon: '✅', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 4 },
+        { label: '誓言模糊·但过了',       icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '血誓被拒',               icon: '🚫', rarity: 'C', weight: Math.max(5, 33 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_4', title: '⚔️ 修罗第四考·剑阵', icon: '🗡️', minLevel: 56, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_3'],
+    prelude: '第四考：穿越三十六把修罗剑的剑阵！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '毫发无伤·获得修罗魂骨！！', icon: '🗡️', rarity: 'SSS', weight: 10, levelBoost: 7, soulBone: { slot: 'leftArm', beast: '修罗剑灵', year: 90000, skill: '修罗剑气', rarity: 'SS' } },
+        { label: '穿过剑阵·获得认可',         icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '受轻伤·通过了',             icon: '🩹', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '失败·被剑阵逼退',           icon: '😔', rarity: 'C', weight: 38, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 4500)
+    },
+  },
+  {
+    id: 'arc_asura_5', title: '⚔️ 修罗第五考·血池', icon: '🩸', minLevel: 58, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_4'],
+    prelude: '第五考：浸泡修罗血池！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.5, (state.combatPower || state.level * 10) / 2800)
+      return [
+        { label: '血池淬体·修罗之体大成！！', icon: '🩸', rarity: 'SSS', weight: Math.floor(12 * pwr), levelBoost: 8 },
+        { label: '成功承受·体质大增',         icon: '💪', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 5 },
+        { label: '勉强承受·通过了',           icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '无法承受',                   icon: '🏃', rarity: 'C', weight: Math.max(5, 33 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_6', title: '⚔️ 修罗第六考·修罗魂环', icon: '💍', minLevel: 60, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_5'],
+    prelude: '第六考：猎杀上古修罗兽，吸收十万年魂环！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '斩杀·获得十万年魂环！！', icon: '💍', rarity: 'SSS', weight: 8, levelBoost: 8, soulRing: { slot: 6, year: 100000, colorName: '十万年', colorHex: '#FF1744', beast: '上古修罗兽', skill: '修罗审判' } },
+        { label: '击杀·获得认可',           icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '打伤·勉强通过',           icon: '🩹', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '失败·退回血池',           icon: '😔', rarity: 'C', weight: 40, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 5000)
+    },
+  },
+  {
+    id: 'arc_asura_7', title: '⚔️ 修罗第七考·杀戮领域', icon: '🌐', minLevel: 62, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_6'],
+    prelude: '第七考：在杀戮领域中觉醒！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 4000)
+      return [
+        { label: '领域觉醒·修罗领域！！', icon: '🌐', rarity: 'SSS', weight: Math.floor(10 * pwr), levelBoost: 8, worldImpact: { domain: '修罗领域' } },
+        { label: '领域初成·修罗之力大增', icon: '⚔️', rarity: 'SS', weight: Math.floor(25 * pwr), levelBoost: 5 },
+        { label: '勉强抵抗·通过',         icon: '😰', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '被领域逼退·失败',       icon: '😵', rarity: 'C', weight: Math.max(5, 35 - Math.floor(10 * pwr)), levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_8', title: '⚔️ 修罗第八考·王座', icon: '👑', minLevel: 65, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_7'],
+    prelude: '第八考：坐上修罗王座！命运之轮，请转动——',
+    computeOptions(state) {
+      const pwr = Math.max(0.3, (state.combatPower || state.level * 10) / 5000)
+      return [
+        { label: '坐上王座·修罗神力！！', icon: '👑', rarity: 'SSS', weight: Math.floor(8 * pwr), levelBoost: 10 },
+        { label: '坐下半刻·获得祝福',     icon: '✅', rarity: 'SS', weight: Math.floor(22 * pwr), levelBoost: 6 },
+        { label: '触碰王座·获得印记',     icon: '✨', rarity: 'S', weight: 28, levelBoost: 5 },
+        { label: '被弹飞',                 icon: '💨', rarity: 'B', weight: Math.max(5, 42 - Math.floor(10 * pwr)), levelBoost: 3 },
+      ]
+    },
+  },
+  {
+    id: 'arc_asura_9', title: '⚔️ 修罗第九考·杀神降临', icon: '⚔️', minLevel: 68, maxLevel: 100, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['arc_asura_8'],
+    prelude: '第九考——继承修罗神位！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '继承修罗神位！！',   icon: '⚔️', rarity: 'SSS', weight: 10, levelBoost: 12, worldImpact: { asuraInherited: true } },
+        { label: '接受·神位不完整',   icon: '⭐', rarity: 'SS', weight: 22, levelBoost: 8 },
+        { label: '获得印记·日后继承', icon: '✨', rarity: 'S', weight: 28, levelBoost: 6 },
+        { label: '拒绝·选择人间',     icon: '🚫', rarity: 'A', weight: 20, levelBoost: 5 },
+        { label: '失败·送回凡间',     icon: '⬇️', rarity: 'C', weight: 20, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 10000)
+    },
+  },
+  {
+    id: 'event_ancient', title: '🏛️ 远古遗迹', icon: '🏚️', minLevel: 70, maxLevel: 100, rarity: 'SS',
+    prelude: '你在荒野中发现了一座被遗忘的远古遗迹——墙壁上刻满了失传的魂技图谱。命运之轮，请转动——',
+    computeOptions(state) {
+      const power = state.combatPower || state.level * 10
+      return [
+        { label: '破解古文字·领悟失传魂技！！', icon: '📜', rarity: 'SSS', weight: power >= 20000 ? 18 : 6, levelBoost: 8 },
+        { label: '拓印图谱·带回研究',           icon: '📸', rarity: 'SS',  weight: 25, levelBoost: 5 },
+        { label: '找到古老魂导器',               icon: '🔮', rarity: 'S',   weight: 28, levelBoost: 4 },
+        { label: '触发了陷阱·勉强逃出',         icon: '⚠️', rarity: 'B',   weight: 22, levelBoost: 2 },
+        { label: '遗迹坍塌·空手而归',           icon: '💨', rarity: 'C',   weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'event_arena', title: '⚔️ 封号切磋', icon: '🏟️', minLevel: 75, maxLevel: 100, rarity: 'SS', enemyPower: 5000,
+    prelude: '一位成名已久的封号斗罗向你发出挑战——"老夫倒要看看新晋封号斗罗有几分本事！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '正面击退·赢得老前辈尊重！！', icon: '⚔️', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '平手·双方交换修炼心得',       icon: '🤝', rarity: 'SS',  weight: 22, levelBoost: 5 },
+        { label: '被压制·但学到了很多',         icon: '📖', rarity: 'S',   weight: 28, levelBoost: 4 },
+        { label: '认输·但获得了人脉',           icon: '👋', rarity: 'A',   weight: 25, levelBoost: 3 },
+        { label: '被秒败·差距仍大',             icon: '😵', rarity: 'C',   weight: 15, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 5000)
+    },
+  },
+  {
+    id: 'event_legacy', title: '📜 传承之碑', icon: '🪦', minLevel: 80, maxLevel: 100, rarity: 'SSS',
+    prelude: '你站在一座古老的传承石碑前——碑上刻着历代神祇的名字。一个声音响起："留下你的名字，或者继承先辈的意志。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '继承神之意志·获得神赐！！', icon: '🌟', rarity: 'SSS', weight: 8, levelBoost: 12, worldImpact: { legacy: true } },
+        { label: '刻下自己名字·开创时代',     icon: '✍️', rarity: 'SS',  weight: 20, levelBoost: 8 },
+        { label: '铭记先辈·获得指引',         icon: '🙏', rarity: 'S',   weight: 28, levelBoost: 5 },
+        { label: '静静感悟·力量微涨',         icon: '🧘', rarity: 'A',   weight: 25, levelBoost: 3 },
+        { label: '被石碑排斥·无法接近',       icon: '🚫', rarity: 'C',   weight: 19 },
+      ]
+    },
+  },
+
+  // ==================== 分阶原著战斗事件 ====================
+  {
+    id: 'cmb_bandits', title: '⚔️ 盗贼夜袭', icon: '🌙', minLevel: 6, maxLevel: 18, rarity: 'B', enemyPower: 30,
+    prelude: '夜深人静，一伙盗贼摸进了村子！你被嘈杂声惊醒——拿起武器保护家园！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击退盗贼·轻松取胜', icon: '⚔️', rarity: 'SS', weight: 15, levelBoost: 3 },
+        { label: '组织村民·成功击退', icon: '👥', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '智取设陷·大获全胜',   icon: '🧠', rarity: 'S', weight: 22, levelBoost: 4 },
+        { label: '被盗贼打伤·坚守不退', icon: '🩹', rarity: 'C', weight: 20, levelBoost: 1 },
+        { label: '逃跑求救·侥幸逃生', icon: '🏃', rarity: 'C', weight: 15, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 30)
+    },
+  },
+  {
+    id: 'cmb_escort', title: '⚔️ 佣兵护送', icon: '🛡️', minLevel: 12, maxLevel: 30, rarity: 'A', enemyPower: 150,
+    prelude: '佣兵工会发布护送任务——保护商队穿越危险地带。沿途可能遭遇魂兽袭击！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '碾压护送·完美取胜！！', icon: '💰', rarity: 'SS', weight: 18, levelBoost: 4 },
+        { label: '击退袭击·任务完成',   icon: '✅', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '苦战·商队受损但保住货物',   icon: '📦', rarity: 'B', weight: 25, levelBoost: 2 },
+        { label: '遭遇强敌·弃货逃跑',     icon: '🏃', rarity: 'C', weight: 15, levelBoost: 1 },
+        { label: '惨败·全军覆没独自逃生',     icon: '💀', rarity: 'C', weight: 12, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 150)
+    },
+  },
+  {
+    id: 'cmb_horde', title: '⚔️ 魂兽围攻', icon: '🐺', minLevel: 22, maxLevel: 42, rarity: 'S', enemyPower: 500,
+    prelude: '你遭到了一群魂兽的围攻——为首的是千年修为的头狼！狼群从四面八方包围过来。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击杀头狼·狼群溃散',   icon: '🐺', rarity: 'SSS', weight: 10, levelBoost: 6 },
+        { label: '突破包围·杀出血路',   icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '智取·火焰驱散狼群',     icon: '🔥', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '被咬伤·侥幸逃脱',     icon: '🩹', rarity: 'B', weight: 22, levelBoost: 2 },
+        { label: '被狼群淹没·同伴来救', icon: '🆘', rarity: 'C', weight: 18, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 500)
+    },
+  },
+  {
+    id: 'cmb_airDuel', title: '⚔️ 空中对决', icon: '🦅', minLevel: 40, maxLevel: 62, rarity: 'SS', enemyPower: 1200,
+    prelude: '一名飞行系魂师向你发起空中挑战——在百米高空的生死对决！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '空中制胜·斩获飞行魂骨！！', icon: '🦅', rarity: 'SSS', weight: 8, levelBoost: 7, soulBone: { slot: 'torso', beast: '天空之王', year: 50000, skill: '飞行', rarity: 'S' } },
+        { label: '击落对手·大获全胜！！',     icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 6 },
+        { label: '缠斗后平手·惺惺相惜',   icon: '🤝', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '坠落重伤·侥幸逃生',   icon: '🩹', rarity: 'B', weight: 22, levelBoost: 3 },
+        { label: '被击落惨败·大难不死',       icon: '😵', rarity: 'C', weight: 22, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 1200)
+    },
+  },
+  {
+    id: 'cmb_avalanche', title: '⚔️ 雪崩求生', icon: '❄️', minLevel: 50, maxLevel: 70, rarity: 'SS', enemyPower: 1800,
+    prelude: '极北之地的雪崩将你卷入——你必须在暴雪中寻找出路并击退雪怪！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击杀雪怪·找到庇护所',   icon: '❄️', rarity: 'SSS', weight: 10, levelBoost: 8 },
+        { label: '挖出雪洞·撑过暴风雪',   icon: '⛏️', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '与雪怪交涉·和平共处',   icon: '🤝', rarity: 'S', weight: 18, levelBoost: 6 },
+        { label: '被雪掩埋·同伴挖出',     icon: '🆘', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '冻伤惨败·被救援队发现',     icon: '🤕', rarity: 'C', weight: 25, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 1800)
+    },
+  },
+  {
+    id: 'cmb_templeGuard', title: '⚔️ 神庙守卫', icon: '🏛️', minLevel: 62, maxLevel: 82, rarity: 'SSS', enemyPower: 3500,
+    prelude: '远古神庙的守卫——一尊活化的石像巨人——挥舞着巨锤向你砸来！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击碎石像·碾压取胜！！', icon: '💎', rarity: 'SSS', weight: 8, levelBoost: 10 },
+        { label: '找到弱点·击毁核心',     icon: '🧠', rarity: 'SS', weight: 22, levelBoost: 7 },
+        { label: '智取·机关困住石像',       icon: '⚙️', rarity: 'S', weight: 25, levelBoost: 6 },
+        { label: '被震飞·撤退失败',       icon: '💨', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '被巨锤砸扁·侥幸逃生',   icon: '😵', rarity: 'C', weight: 20, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3500)
+    },
+  },
+  {
+    id: 'cmb_dualGod', title: '⚔️ 双神对决', icon: '🌟', minLevel: 82, maxLevel: 98, rarity: 'SSS', enemyPower: 12000,
+    prelude: '海神与修罗神的力量在你体内冲突——你必须同时驾驭两种神力，否则将被撕裂！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '完美平衡·双神共存！！',     icon: '🌟', rarity: 'SSS', weight: 5, levelBoost: 15, worldImpact: { dualGod: true } },
+        { label: '偏向海神·海洋之力大增', icon: '🌊', rarity: 'SS', weight: 15, levelBoost: 10 },
+        { label: '偏向修罗·杀戮之力大增', icon: '⚔️', rarity: 'SS', weight: 15, levelBoost: 10 },
+        { label: '强行压制·获得暂时平衡', icon: '🛡️', rarity: 'S', weight: 28, levelBoost: 7 },
+        { label: '被撕裂重伤·但活下来了',     icon: '💔', rarity: 'B', weight: 20, levelBoost: 5 },
+        { label: '失控惨败·险些陨落',         icon: '😵', rarity: 'C', weight: 17, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 12000)
+    },
+  },
+  {
+    id: 'cmb_finalStand', title: '⚔️ 最终之战', icon: '👑', minLevel: 95, maxLevel: 100, rarity: 'SSS', enemyPower: 20000,
+    prelude: '所有敌人联合起来——这是大陆存亡的最后之战！你站在战场中央，所有同伴都在你身后。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '以一敌万·碾压成神！！', icon: '👑', rarity: 'SSS', weight: 3, levelBoost: 20, worldImpact: { legend: true } },
+        { label: '与同伴联手·大获全胜！！',   icon: '🤝', rarity: 'SSS', weight: 12, levelBoost: 15 },
+        { label: '指挥全局·谋略制胜！！',     icon: '🧠', rarity: 'SS', weight: 20, levelBoost: 12 },
+        { label: '苦战后惨胜·大陆和平',   icon: '🕊️', rarity: 'S', weight: 25, levelBoost: 10 },
+        { label: '力战不敌·被同伴救回',   icon: '🆘', rarity: 'A', weight: 20, levelBoost: 8 },
+        { label: '陨落·但永世传颂',       icon: '💀', rarity: 'B', weight: 20, levelBoost: 5 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 20000)
+    },
+  },
+  {
+    id: 'cmb_awaken', title: '⚔️ 觉醒试炼', icon: '✨', minLevel: 1, maxLevel: 10, rarity: 'B', enemyPower: 20,
+    prelude: '武魂觉醒后，长老让你用刚觉醒的武魂击碎测试石！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '一击粉碎·天赋惊人', icon: '💥', rarity: 'SS', weight: 15, levelBoost: 3 },
+        { label: '成功击碎·顺利通过', icon: '✅', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '勉强击裂·还需努力', icon: '😰', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '惨败·石头纹丝不动',       icon: '😔', rarity: 'C', weight: 25, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 20)
+    },
+  },
+  {
+    id: 'cmb_nottingExam', title: '⚔️ 诺丁考核', icon: '📝', minLevel: 15, maxLevel: 28, rarity: 'A', enemyPower: 100,
+    prelude: '诺丁学院的期末实战考核！对抗一名高年级学员。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '越级击败·碾压全院第一！！', icon: '🏅', rarity: 'SSS', weight: 10, levelBoost: 5 },
+        { label: '艰难取胜·通过考核', icon: '⚔️', rarity: 'A', weight: 28, levelBoost: 3 },
+        { label: '平手·双方升级',     icon: '🤝', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '被击败·需补考',     icon: '😔', rarity: 'C', weight: 32, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 100)
+    },
+  },
+  {
+    id: 'cmb_beastKing', title: '⚔️ 兽王领地', icon: '👑', minLevel: 25, maxLevel: 40, rarity: 'S', enemyPower: 350,
+    prelude: '星斗大森林深处，你误入万年魂兽的领地——它已发现你！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败兽王·斩获万年魂环！！', icon: '💍', rarity: 'SSS', weight: 8, levelBoost: 7, soulRing: { year: 30000, colorName: '万年', colorHex: '#212121', beast: '万年兽王', skill: '兽王咆哮' } },
+        { label: '击退兽王·成功脱险',     icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 5 },
+        { label: '智取逃脱·利用地形',     icon: '🧠', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '受伤逃跑·捡回一命',     icon: '🏃', rarity: 'C', weight: 25, levelBoost: 2 },
+        { label: '被兽王碾压·侥幸逃生',   icon: '😵', rarity: 'C', weight: 19, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 350)
+    },
+  },
+  {
+    id: 'cmb_shrekBrawl', title: '⚔️ 七怪混战', icon: '👥', minLevel: 35, maxLevel: 50, rarity: 'S', enemyPower: 600,
+    prelude: '弗兰德院长突发奇想——七怪自由混战！最后站着的就是今天的优胜者！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '碾压全场·最后站着！！', icon: '🏆', rarity: 'SSS', weight: 8, levelBoost: 8 },
+        { label: '坚持到前三·表现出色', icon: '🥉', rarity: 'SS', weight: 22, levelBoost: 5 },
+        { label: '中游表现·学到配合', icon: '🤝', rarity: 'A', weight: 30, levelBoost: 3 },
+        { label: '第一个被淘汰·但学到了', icon: '😅', rarity: 'B', weight: 25, levelBoost: 2 },
+        { label: '被秒杀惨败·差距悬殊',     icon: '😵', rarity: 'C', weight: 15, levelBoost: 1 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 600)
+    },
+  },
+  {
+    id: 'cmb_eliteTeam', title: '⚔️ 武魂殿战队', icon: '⛪', minLevel: 45, maxLevel: 60, rarity: 'SS', enemyPower: 1000,
+    prelude: '精英赛最终战——对手是武魂殿黄金一代！三位魂王级别的最强天才！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败武魂殿·碾压夺冠！！', icon: '👑', rarity: 'SSS', weight: 6, levelBoost: 10, worldImpact: { biBiDong: { met: true, affinity: -20 } } },
+        { label: '苦战险胜·全场鼓掌',   icon: '⚔️', rarity: 'SS', weight: 18, levelBoost: 7 },
+        { label: '惜败·但名扬大陆',     icon: '🥈', rarity: 'S', weight: 25, levelBoost: 5 },
+        { label: '被打败·但学到很多',   icon: '📖', rarity: 'A', weight: 28, levelBoost: 3 },
+        { label: '被碾压惨败·武魂殿太强', icon: '😵', rarity: 'C', weight: 23, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 1000)
+    },
+  },
+  {
+    id: 'cmb_seaGuardian', title: '⚔️ 海神守护者', icon: '🔱', minLevel: 55, maxLevel: 72, rarity: 'SS', enemyPower: 2000,
+    prelude: '海神岛的守护者——一位海魂斗罗——挡在你面前！"要见海神，先过我这一关！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败守护者·海神认可！！', icon: '🔱', rarity: 'SSS', weight: 8, levelBoost: 9 },
+        { label: '打平·守护者让你通过',     icon: '🤝', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '被压制·但坚持住了',       icon: '💪', rarity: 'A', weight: 30, levelBoost: 4 },
+        { label: '被击倒·但未放弃',         icon: '🩹', rarity: 'B', weight: 25, levelBoost: 3 },
+        { label: '被秒杀惨败·丢回船上',         icon: '😵', rarity: 'C', weight: 15, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 2000)
+    },
+  },
+  {
+    id: 'cmb_titleDuel', title: '⚔️ 封号对决', icon: '👑', minLevel: 65, maxLevel: 82, rarity: 'SSS', enemyPower: 3000,
+    prelude: '一位成名已久的封号斗罗向你发起挑战——"让我看看你是否配得上传说的称号！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败封号斗罗·震惊天下！！', icon: '👑', rarity: 'SSS', weight: 8, levelBoost: 10 },
+        { label: '缠斗百回合·虽败犹荣',   icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 7 },
+        { label: '请教切磋·获得指点',     icon: '📖', rarity: 'S', weight: 25, levelBoost: 5 },
+        { label: '被压制·但了解差距',     icon: '😰', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '被秒杀·受教了',         icon: '😵', rarity: 'C', weight: 20, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 3000)
+    },
+  },
+  {
+    id: 'cmb_warfront', title: '⚔️ 前线冲锋', icon: '🏇', minLevel: 75, maxLevel: 92, rarity: 'SSS', enemyPower: 5000,
+    prelude: '武魂帝国发起总攻！你被编入突击队——目标是直取敌军指挥部！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '直取指挥部·扭转战局',   icon: '🏆', rarity: 'SSS', weight: 8, levelBoost: 12 },
+        { label: '斩将夺旗·大破敌军',     icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 8 },
+        { label: '掩护战友·立下战功',     icon: '🛡️', rarity: 'S', weight: 25, levelBoost: 6 },
+        { label: '负伤撤退·保住性命',     icon: '🩹', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '溃败·被友军救回',       icon: '😰', rarity: 'C', weight: 22, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 5000)
+    },
+  },
+  {
+    id: 'cmb_divineGate', title: '⚔️ 神域之门', icon: '☁️', minLevel: 85, maxLevel: 100, rarity: 'SSS', enemyPower: 10000,
+    prelude: '神界之门前，远古神祇的幻影挡住去路——"凡人，证明你有资格踏入神的领域！"命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败神影·踏入神域',   icon: '☁️', rarity: 'SSS', weight: 5, levelBoost: 15 },
+        { label: '通过考验·获准入内',   icon: '✅', rarity: 'SS', weight: 18, levelBoost: 10 },
+        { label: '被神威压迫·但不放弃', icon: '💪', rarity: 'S', weight: 25, levelBoost: 7 },
+        { label: '被打回凡间·留下烙印', icon: '⬇️', rarity: 'A', weight: 27, levelBoost: 5 },
+        { label: '神之蔑视·被秒杀',     icon: '😵', rarity: 'C', weight: 25, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 10000)
+    },
+  },
+  {
+    id: 'battle_notting', title: '⚔️ 诺丁学院实战', icon: '⚔️', minLevel: 12, maxLevel: 22, rarity: 'A', enemyPower: 50,
+    prelude: '诺丁学院实战课——对手是比你高一级的学长。命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '越级获胜·天赋惊人', icon: '💪', rarity: 'SS', weight: 15, levelBoost: 4 },
+        { label: '顽强对抗·最终险胜', icon: '⚔️', rarity: 'A', weight: 28, levelBoost: 2 },
+        { label: '平局·学到很多',     icon: '🤝', rarity: 'B', weight: 30, levelBoost: 1 },
+        { label: '落败·差距不大',     icon: '😔', rarity: 'C', weight: 20, levelBoost: 1 },
+        { label: '被轻松击败',        icon: '💨', rarity: 'C', weight: 7 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 50)
+    },
+  },
+  {
+    id: 'battle_forest', title: '⚔️ 猎魂森林', icon: '🌲', minLevel: 18, maxLevel: 28, rarity: 'A', enemyPower: 80,
+    prelude: '猎魂森林——一头百年魂兽突然从灌木中窜出！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '轻松猎杀·获得魂兽材料', icon: '⚡', rarity: 'SS', weight: 12, levelBoost: 3 },
+        { label: '成功猎杀·积累经验',     icon: '✅', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '与同伴合作击败',       icon: '🤝', rarity: 'B', weight: 28, levelBoost: 2 },
+        { label: '被突袭·受了轻伤',     icon: '🤕', rarity: 'B', weight: 20, levelBoost: 1 },
+        { label: '魂兽逃走了',           icon: '🏃', rarity: 'C', weight: 10 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 80)
+    },
+  },
+  {
+    id: 'battle_rival', title: '⚔️ 学院大比', icon: '🏟️', minLevel: 25, maxLevel: 48, rarity: 'S', enemyPower: 200,
+    prelude: '史莱克学院内部选拔赛——对手是同级最强学员！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败对手·成为首席！！', icon: '🏆', rarity: 'SSS', weight: 10, levelBoost: 5 },
+        { label: '激战后获胜',             icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 3 },
+        { label: '巧用战术·智取',         icon: '🧠', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '惜败·展现潜力',         icon: '🤝', rarity: 'A', weight: 25, levelBoost: 2 },
+        { label: '完败·差距明显',         icon: '😔', rarity: 'C', weight: 15 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 200)
+    },
+  },
+  {
+    id: 'battle_elite', title: '⚔️ 精英赛对战', icon: '🏟️', minLevel: 38, maxLevel: 65, rarity: 'SS', enemyPower: 500,
+    prelude: '全大陆精英赛正赛——天斗皇家学院的王牌战队！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '完美破解融合技·震惊全场！！', icon: '💥', rarity: 'SSS', weight: 8, levelBoost: 8 },
+        { label: '击败对手·晋级下一轮',         icon: '🥇', rarity: 'SS', weight: 20, levelBoost: 5 },
+        { label: '团队配合·协力获胜',           icon: '🤝', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '惜败·全场起立鼓掌',           icon: '👏', rarity: 'A', weight: 25, levelBoost: 3 },
+        { label: '被天赋碾压·学到很多',         icon: '📖', rarity: 'B', weight: 19, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 500)
+    },
+  },
+  {
+    id: 'battle_wuhun', title: '⚔️ 武魂殿阻击战', icon: '⛪', minLevel: 50, maxLevel: 65, rarity: 'SS', enemyPower: 800,
+    prelude: '武魂殿精英小队拦住了去路——三名魂王级强者！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '以一敌三·反杀！！', icon: '💀', rarity: 'SSS', weight: 6, levelBoost: 10, worldImpact: { biBiDong: { affinity: -30 } } },
+        { label: '击退敌人·成功突围', icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 6 },
+        { label: '智取·利用地形逃脱', icon: '🧠', rarity: 'S', weight: 28, levelBoost: 4 },
+        { label: '负伤逃脱·活了下来', icon: '🩹', rarity: 'A', weight: 25, levelBoost: 3 },
+        { label: '被俘·同伴救出',     icon: '🆘', rarity: 'B', weight: 15, levelBoost: 5 },
+        { label: '惨败·运气逃出生天', icon: '🍀', rarity: 'C', weight: 6 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 800)
+    },
+  },
+  {
+    id: 'battle_seabeast', title: '⚔️ 深海遭遇战', icon: '🌊', minLevel: 58, maxLevel: 72, rarity: 'SS', enemyPower: 1200,
+    prelude: '前往海神岛途中——万年邪魔虎鲸跃出深海！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '斩杀虎鲸·获得万年魂环！！', icon: '🐋', rarity: 'SSS', weight: 6, levelBoost: 8, soulRing: { year: 60000, colorName: '五万年', colorHex: '#4A148C', beast: '邪魔虎鲸', skill: '虎鲸破浪' } },
+        { label: '击退虎鲸·成功脱险',         icon: '⚔️', rarity: 'SS', weight: 20, levelBoost: 5 },
+        { label: '海神岛守卫出手相助',         icon: '🆘', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '船只受损·漂流到荒岛',       icon: '🏝️', rarity: 'A', weight: 25, levelBoost: 4 },
+        { label: '沉船·获救但伤亡惨重',       icon: '🚢', rarity: 'C', weight: 21, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 1200)
+    },
+  },
+  {
+    id: 'battle_defend', title: '⚔️ 嘉陵关守城', icon: '🏰', minLevel: 68, maxLevel: 82, rarity: 'SSS', enemyPower: 2000,
+    prelude: '武魂帝国大军压境——你必须守住嘉陵关东门！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '万夫莫开·守住了！！', icon: '🛡️', rarity: 'SSS', weight: 8, levelBoost: 10, worldImpact: { tangSan: { affinity: 30 } } },
+        { label: '艰难守城·援军赶到',   icon: '⚔️', rarity: 'SS', weight: 22, levelBoost: 6 },
+        { label: '用计策拖延·争取时间', icon: '🧠', rarity: 'S', weight: 30, levelBoost: 5 },
+        { label: '城门被破·掩护撤退',   icon: '🏃', rarity: 'A', weight: 22, levelBoost: 3 },
+        { label: '防线崩坏·溃败',       icon: '💔', rarity: 'C', weight: 18, levelBoost: 2 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 2000)
+    },
+  },
+  {
+    id: 'battle_godGuard', title: '⚔️ 神界守卫战', icon: '☁️', minLevel: 85, maxLevel: 98, rarity: 'SSS', enemyPower: 5000,
+    prelude: '神界守卫者——远古神祇残魂挡住了去路！命运之轮，请转动——',
+    computeOptions(state) {
+      const base = [
+        { label: '击败守卫·获得神位线索！！', icon: '⚡', rarity: 'SSS', weight: 5, levelBoost: 12 },
+        { label: '通过考验·守卫认可了你',     icon: '✅', rarity: 'SS', weight: 18, levelBoost: 8 },
+        { label: '智取·绕过守卫防御',         icon: '🧠', rarity: 'S', weight: 28, levelBoost: 6 },
+        { label: '被击退·守卫没下杀手',       icon: '💨', rarity: 'A', weight: 28, levelBoost: 4 },
+        { label: '被打败·退回凡间',           icon: '⬇️', rarity: 'C', weight: 21, levelBoost: 3 },
+      ]
+      return adjustCombatWeights(base, state.combatPower || state.level * 10, 5000)
+    },
+  },
+  {
+    id: 'hellRoad', title: '🔥 地狱路', icon: '💀', minLevel: 42, maxLevel: 58, rarity: 'SSS', isMilestone: true,
+    requiredEvents: ['slaughterCity'],
+    prelude: '杀戮之都最深处——地狱路！走过它，你将觉醒杀神领域。命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '走过地狱路·觉醒杀神领域！！', icon: '⚔️', rarity: 'SSS', weight: 10, levelBoost: 8, worldImpact: { domain: '杀神领域' } },
+        { label: '艰难走过·领域初步觉醒',       icon: '🩸', rarity: 'SS', weight: 22, levelBoost: 5, worldImpact: { domain: '杀神领域' } },
+        { label: '被幻象困住·侥幸逃脱',         icon: '👻', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '无法通过·退回避开',           icon: '↩️', rarity: 'B', weight: 25, levelBoost: 2 },
+        { label: '迷失·生死不明',               icon: '🌫️', rarity: 'C', weight: 15 },
+      ]
+    },
+  },
+  {
+    id: 'blueSilver_awaken', title: '🌿 蓝银异动', icon: '🌱', minLevel: 30, maxLevel: 55, rarity: 'SS', isMilestone: true,
+    prelude: '你的蓝银草武魂突然不受控制地疯狂生长！一股古老而强大的意识在呼唤你——蓝银皇血脉在觉醒！命运之轮，请转动——',
+    computeOptions(state) {
+      const soul = state.attributes?.soulType || ''
+      if (!soul.includes('蓝银')) return [{ label: '你的武魂不是蓝银草', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '成功觉醒·蓝银皇血脉！！', icon: '🌿', rarity: 'SSS', weight: 15, levelBoost: 7 },
+        { label: '部分觉醒·获得蓝银之力',   icon: '💚', rarity: 'SS', weight: 28, levelBoost: 4 },
+        { label: '压制异动·暂时稳定',       icon: '🛑', rarity: 'A', weight: 30, levelBoost: 2 },
+        { label: '觉醒失败·蓝银枯萎',       icon: '🥀', rarity: 'C', weight: 27 },
+      ]
+    },
+  },
+  {
+    id: 'blueSilver_evolve', title: '🌿 蓝银领域', icon: '✨', minLevel: 40, maxLevel: 70, rarity: 'SSS',
+    requiredEvents: ['blueSilver_awaken'],
+    prelude: '蓝银皇血脉完全觉醒！蓝银领域展开——所有的蓝银草都是你的眼睛和武器！命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '领域展开·万物生长！！', icon: '🌿', rarity: 'SSS', weight: 20, levelBoost: 8, worldImpact: { domain: '蓝银领域' } },
+        { label: '领域初成·掌控自然之力', icon: '💚', rarity: 'SS', weight: 30, levelBoost: 5, worldImpact: { domain: '蓝银领域' } },
+        { label: '领域不稳定·需要磨合',   icon: '🔄', rarity: 'S', weight: 28, levelBoost: 3 },
+        { label: '觉醒失败·武魂增强',     icon: '📈', rarity: 'B', weight: 22, levelBoost: 2 },
+      ]
+    },
+  },
+  {
+    id: 'angel_descent', title: '👼 天使降临', icon: '✨', minLevel: 45, maxLevel: 80, rarity: 'SSS',
+    requiredEvents: ['interact_qianRenXue'],
+    prelude: '六翼天使虚影从天而降！千仞雪向你伸出手："天使神选中了你。接受天使祝福，觉醒天使领域。"命运之轮，请转动——',
+    computeOptions(state) {
+      const met = state.relationships?.qianRenXue?.met
+      if (!met) return [{ label: '你还没见过千仞雪', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '接受祝福·觉醒天使领域！！', icon: '👼', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { domain: '天使领域', qianRenXue: { affinity: 50 } } },
+        { label: '接受·领域弱化',             icon: '🙏', rarity: 'SS', weight: 25, levelBoost: 5, worldImpact: { domain: '天使领域' } },
+        { label: '犹豫后最终接受',             icon: '🤔', rarity: 'S', weight: 28, levelBoost: 4, worldImpact: { domain: '天使领域' } },
+        { label: '拒绝·天使光影消散',         icon: '🚫', rarity: 'B', weight: 22, levelBoost: 2 },
+        { label: '被天使神威所伤',             icon: '😰', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+  {
+    id: 'asura_call', title: '⚔️ 修罗召唤', icon: '💀', minLevel: 70, maxLevel: 90, rarity: 'SSS',
+    prelude: '深夜，血色光柱笼罩你——修罗神在召唤！"杀戮与审判的权柄，属于最强者。"命运之轮，请转动——',
+    computeOptions(state) {
+      return [
+        { label: '接受试炼·踏上修罗之路',   icon: '⚔️', rarity: 'SSS', weight: 12, levelBoost: 6 },
+        { label: '修罗神不容拒绝',           icon: '😰', rarity: 'SS', weight: 22, levelBoost: 4 },
+        { label: '拒绝·光柱消散',           icon: '🚫', rarity: 'B', weight: 30, levelBoost: 2 },
+        { label: '被吞噬·强制试炼',         icon: '🌀', rarity: 'S', weight: 36, levelBoost: 5 },
+      ]
+    },
+  },
+  {
+    id: 'death_seed', title: '🖤 死亡种子', icon: '🥀', minLevel: 45, maxLevel: 70, rarity: 'SS',
+    prelude: '你体内涌起阴冷的力量——邪魂师血脉中的死亡之力在觉醒。一颗死亡种子正在灵魂中扎根……命运之轮，请转动——',
+    computeOptions(state) {
+      const isEvil = state.attributes?.race === '邪魂师血脉' || state.attributes?.soulType?.includes('邪') || state.attributes?.soulType?.includes('死') || state.attributes?.soulType?.includes('噬魂') || state.attributes?.soulType?.includes('死亡')
+      if (!isEvil) return [{ label: '你体内没有邪魂师力量', icon: '❓', rarity: 'C', weight: 100 }]
+      return [
+        { label: '接受种子·觉醒死亡领域！！', icon: '💀', rarity: 'SSS', weight: 15, levelBoost: 8, worldImpact: { domain: '死亡领域' } },
+        { label: '压制种子·保留力量',         icon: '🛑', rarity: 'SS', weight: 25, levelBoost: 5 },
+        { label: '种子爆发·失控但觉醒',       icon: '🔥', rarity: 'S', weight: 28, levelBoost: 6, worldImpact: { domain: '死亡领域' } },
+        { label: '排斥种子·力量消散',         icon: '💨', rarity: 'B', weight: 22, levelBoost: 2 },
+        { label: '种子反噬·重伤',             icon: '🤕', rarity: 'C', weight: 10 },
+      ]
+    },
+  },
+]
+
+// ========== 工具函数 ==========
+
+/** 获取指定等级区间的事件池 */
+export function getEventPool(minLevel, maxLevel = 100) {
+  return EVENT_POOL.filter(ev => ev.minLevel >= minLevel && ev.minLevel <= maxLevel)
+}
+
+/** 获取所有事件ID列表 */
+export function getAllEventIds() {
+  return EVENT_POOL.map(ev => ev.id)
+}
+
+/** 根据ID获取事件 */
+export function getEventById(id) {
+  return EVENT_POOL.find(ev => ev.id === id)
+}
